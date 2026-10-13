@@ -124,6 +124,7 @@ async fn fixture_full(
         metrics: Arc::new(metrics::Metrics::new()),
         webhook_capacity: 8,
         webhook_sender: webhook_tx,
+        ingest_slots: Arc::new(tokio::sync::Semaphore::new(8)),
     });
     let router = ingest::build_router(state);
     tokio::spawn(async move {
@@ -1293,6 +1294,8 @@ async fn seed_one_event(store: &Store, project: &str, fingerprint: &str) -> i64 
         extra: None,
         user: None,
         request: None,
+        logentry: None,
+        fingerprint: None,
     };
     store.insert_event(r.issue.id, &ev).await.unwrap();
     r.issue.id

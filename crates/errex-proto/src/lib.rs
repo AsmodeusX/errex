@@ -9,7 +9,7 @@ pub mod issue;
 pub mod wire;
 
 pub use error::ProtoError;
-pub use event::{Event, ExceptionContainer, ExceptionInfo, Frame, Level, Stacktrace};
+pub use event::{Event, ExceptionContainer, ExceptionInfo, Frame, Level, LogEntry, Stacktrace};
 pub use fingerprint::Fingerprint;
 pub use issue::{Issue, IssueStatus};
 pub use wire::{ClientMessage, ServerMessage};

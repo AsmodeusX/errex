@@ -57,7 +57,7 @@ pub async fn handle(
     let rx = state.fanout.subscribe();
     let metrics = state.metrics.clone();
     upgrade.on_upgrade(move |socket| async move {
-        if let Err(err) = run(socket, store, rx, metrics).await {
+        if let Err(err) = run(socket, store, rx, metrics, state, headers).await {
             tracing::debug!(%err, "ws connection closed");
         }
     })
@@ -95,13 +95,19 @@ fn origin_allowed(origin: &str, public_url: &str, dev_mode: bool) -> bool {
     false
 }
 
+const SESSION_RECHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+
 async fn run(
     socket: WebSocket,
     store: Store,
     mut fanout: broadcast::Receiver<ServerMessage>,
     metrics: Arc<crate::metrics::Metrics>,
+    state: Arc<AppState>,
+    headers: HeaderMap,
 ) -> Result<(), DaemonError> {
     let (mut write, mut read) = socket.split();
+    let mut session_recheck = tokio::time::interval(SESSION_RECHECK_INTERVAL);
+    session_recheck.tick().await;
 
     // Subscribing happened before this snapshot loaded, so any concurrent
     // updates arrive after — possibly re-stating an issue already in the
@@ -135,6 +141,12 @@ async fn run(
                 }
                 Err(broadcast::error::RecvError::Closed) => break,
             },
+
+            _ = session_recheck.tick() => {
+                if crate::auth::require_auth(&state, &headers).await.is_err() {
+                    break;
+                }
+            }
 
             // Client-side traffic. Only honors pings today; richer commands
             // (resolve, mute) land here as the daemon grows.

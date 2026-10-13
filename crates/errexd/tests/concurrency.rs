@@ -86,6 +86,8 @@ fn sample_event(fp_seed: u64) -> Event {
         extra: None,
         user: None,
         request: None,
+        logentry: None,
+        fingerprint: None,
     }
 }
 

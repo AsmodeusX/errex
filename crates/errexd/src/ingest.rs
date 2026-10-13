@@ -76,6 +76,9 @@ pub struct AppState {
     /// Live handle to the webhook sender so `/metrics` can report depth
     /// without an extra plumbed counter. Not used to send.
     pub webhook_sender: tokio::sync::mpsc::Sender<crate::webhook::Trigger>,
+    /// Bounds how many envelopes are decompressed and parsed at once, so
+    /// peak memory is a function of this limit rather than of request count.
+    pub ingest_slots: Arc<tokio::sync::Semaphore>,
 }
 
 /// Build the API router without binding a listener. Extracted so tests can
@@ -1039,6 +1042,10 @@ async fn ingest_envelope(
         state.metrics.inc_rejected_rate_limit();
         return (StatusCode::TOO_MANY_REQUESTS, "rate limit exceeded").into_response();
     }
+    let _slot = match state.ingest_slots.acquire().await {
+        Ok(permit) => permit,
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    };
     let raw = match maybe_gunzip(&body) {
         Ok(v) => v,
         Err(err) => {
@@ -1147,12 +1154,15 @@ fn parse_envelope(raw: &[u8]) -> Result<Vec<Event>, ProtoError> {
         let item_type = header.get("type").and_then(|v| v.as_str()).unwrap_or("");
 
         let payload_end = if let Some(len) = header.get("length").and_then(|v| v.as_u64()) {
-            let end = cursor + len as usize;
-            if end > raw.len() {
+            let end = usize::try_from(len)
+                .ok()
+                .and_then(|len| cursor.checked_add(len))
+                .filter(|&end| end <= raw.len());
+            let Some(end) = end else {
                 return Err(ProtoError::InvalidEnvelope(
                     "item length exceeds envelope size".into(),
                 ));
-            }
+            };
             end
         } else {
             // No length: payload runs to the next newline (or to EOF).
@@ -1224,6 +1234,13 @@ mod tests {
             events[0].primary_exception().and_then(|e| e.ty.as_deref()),
             Some("Boom")
         );
+    }
+
+    #[test]
+    fn rejects_length_that_overflows_cursor() {
+        let item_header = r#"{"type":"event","length":18446744073709551615}"#;
+        let envelope = format!("{}\n{}\n{{}}\n", header(), item_header);
+        assert!(parse_envelope(envelope.as_bytes()).is_err());
     }
 
     #[test]

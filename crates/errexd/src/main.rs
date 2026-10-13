@@ -81,10 +81,13 @@ enum ProjectCmd {
 }
 
 /// Channel depth for events flowing from HTTP handlers into the digest task.
-/// Backpressure: HTTP requests block briefly when this fills, which is the
-/// desired signal under sustained overload. Sized for self-host: ~256 events
-/// in flight × ~2 KB JSON each ≈ 512 KB worst-case buffering.
-const INGEST_CHANNEL_CAPACITY: usize = 256;
+/// Backpressure: HTTP requests block briefly when this fills. A single event
+/// can be up to the 8 MiB decompressed envelope limit, so this depth is kept
+/// small to bound worst-case buffering on a 1 GB host.
+const INGEST_CHANNEL_CAPACITY: usize = 32;
+
+/// Maximum envelopes decompressed and parsed concurrently.
+const INGEST_CONCURRENCY: usize = 8;
 
 /// Broadcast capacity for fan-out to SPA clients. Lagging subscribers drop
 /// messages silently — the next snapshot they pull will catch them up.
@@ -170,6 +173,7 @@ async fn main() -> anyhow::Result<()> {
         metrics: metrics_handle.clone(),
         webhook_capacity: WEBHOOK_CHANNEL_CAPACITY,
         webhook_sender: webhook_tx.clone(),
+        ingest_slots: Arc::new(tokio::sync::Semaphore::new(INGEST_CONCURRENCY)),
     });
     // The WS fan-out is mounted on the HTTP listener via axum (see
     // crate::ws), so there's no separate task to spawn here.

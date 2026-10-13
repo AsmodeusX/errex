@@ -24,6 +24,7 @@ use crate::webhook;
 /// Stress-tested at 32 — increasing it bumps the saturation throughput
 /// but enlarges the worst-case tail when a checkpoint stalls a big tx.
 const BATCH_SIZE: usize = 16;
+const BATCH_RETRIES: u32 = 3;
 
 /// What the ingest layer hands to the digest task.
 ///
@@ -169,15 +170,23 @@ async fn process_batch(
         })
         .collect();
 
-    let results: Vec<UpsertResult> = match store.upsert_batch_with_events(&inputs).await {
-        Ok(r) => r,
-        Err(err) => {
-            // The whole batch was rolled back. Log loudly and drop them
-            // — better than crashing the digest task and stranding every
-            // subsequent event on the channel.
-            tracing::error!(%err, batch_size = buf.len(), "digest: upsert_batch failed");
-            buf.clear();
-            return;
+    let mut attempt = 0;
+    let results: Vec<UpsertResult> = loop {
+        match store.upsert_batch_with_events(&inputs).await {
+            Ok(r) => break r,
+            Err(err) if attempt < BATCH_RETRIES => {
+                attempt += 1;
+                tracing::warn!(%err, attempt, "digest: upsert_batch failed, retrying");
+                tokio::time::sleep(std::time::Duration::from_millis(100 * attempt as u64)).await;
+            }
+            Err(err) => {
+                // Each attempt rolled back, so nothing is half-written. Give
+                // up loudly rather than crash the digest task and strand
+                // every subsequent event on the channel.
+                tracing::error!(%err, batch_size = buf.len(), "digest: upsert_batch failed");
+                buf.clear();
+                return;
+            }
         }
     };
 

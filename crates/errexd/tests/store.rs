@@ -91,6 +91,8 @@ fn sample_event(ty: &str, value: &str, function: &str, lineno: u32) -> Event {
         extra: None,
         user: None,
         request: None,
+        logentry: None,
+        fingerprint: None,
     }
 }
 
@@ -547,12 +549,12 @@ async fn open_applies_perf_pragmas() {
     // 0 = default, 1 = file, 2 = memory.
     assert_eq!(temp.0, 2, "temp_store should be MEMORY");
 
-    // synchronous=OFF (0) — fsync skipped on COMMIT and checkpoint.
+    // synchronous=NORMAL (1) — the standard WAL pairing; OFF can corrupt on power loss.
     let sync: (i64,) = sqlx::query_as("PRAGMA synchronous")
         .fetch_one(store.pool())
         .await
         .expect("read synchronous");
-    assert_eq!(sync.0, 0, "synchronous should be OFF (0)");
+    assert_eq!(sync.0, 1, "synchronous should be NORMAL (1)");
 }
 
 #[tokio::test]
@@ -2178,4 +2180,43 @@ async fn prune_auth_attempts_deletes_only_old() {
         .await
         .unwrap();
     assert_eq!(n, 1);
+}
+
+#[tokio::test]
+async fn replayed_event_does_not_bump_count_or_reopen_issue() {
+    let (store, _dir) = fresh_store().await;
+    let now = Utc::now();
+    let ev = sample_event("Boom", "v", "fa", 1);
+    let (id, pl) = precomputed(&ev);
+    let fp_a = fp("a");
+    let batch = [BatchUpsertInput {
+        project: "p",
+        fp: &fp_a,
+        title: "T",
+        culprit: None,
+        level: None,
+        now,
+        event_id: &id,
+        payload: &pl,
+    }];
+    store.upsert_batch_with_events(&batch).await.unwrap();
+    sqlx::query("UPDATE issues SET status = 'resolved'")
+        .execute(store.pool())
+        .await
+        .unwrap();
+
+    let replay = store.upsert_batch_with_events(&batch).await.unwrap();
+    assert!(!replay[0].regressed);
+    assert_eq!(replay[0].issue.status, errex_proto::IssueStatus::Resolved);
+    assert_eq!(replay[0].issue.event_count, 1);
+
+    let received: (String,) = sqlx::query_as("SELECT received_at FROM events")
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
+    assert!(
+        received.0.contains('T'),
+        "received_at must be RFC3339: {}",
+        received.0
+    );
 }

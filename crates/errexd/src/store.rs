@@ -203,12 +203,6 @@ impl Store {
         // Pragma choices are tuned for "minimum hosting RAM" — the
         // load-bearing cost on Railway / Fly / similar.
         //
-        // `synchronous = OFF`: skip COMMIT and checkpoint fsyncs. WAL
-        //   recovery still preserves all committed data on a daemon
-        //   crash; only host power loss can drop up to one
-        //   transaction. SDKs already retry, so this trade is fine for
-        //   an error tracker.
-        //
         // `mmap_size = 16 MB`: virtual mapping window. Default sqlx is
         //   0 (no mmap). 16 MB is enough for hot index pages on a
         //   self-host with ~10k issues; previously 256 MB which over-
@@ -232,7 +226,7 @@ impl Store {
             .filename(db_path)
             .create_if_missing(true)
             .journal_mode(SqliteJournalMode::Wal)
-            .synchronous(SqliteSynchronous::Off)
+            .synchronous(SqliteSynchronous::Normal)
             .busy_timeout(std::time::Duration::from_millis(5000))
             .pragma("wal_autocheckpoint", "1000")
             .pragma("mmap_size", "0")
@@ -413,16 +407,35 @@ impl Store {
 
             let created = inserted == 1;
             let mut regressed = false;
-            if !created {
-                let prev_status: String = sqlx::query_scalar(
-                    "SELECT status FROM issues WHERE project = ? AND fingerprint = ?",
-                )
-                .bind(input.project)
-                .bind(fp_str)
-                .fetch_one(&mut *tx)
-                .await?;
 
-                if IssueStatus::from_db_str(&prev_status) == IssueStatus::Resolved {
+            let row: IssueRow = sqlx::query_as(
+                "SELECT id, project, fingerprint, title, culprit, level, status, \
+                 event_count, first_seen, last_seen \
+                 FROM issues WHERE project = ? AND fingerprint = ?",
+            )
+            .bind(input.project)
+            .bind(fp_str)
+            .fetch_one(&mut *tx)
+            .await?;
+
+            // Append the raw event in the same tx so a partial commit can
+            // never leave an issue without its events. A replayed event_id
+            // is ignored here, and must not bump counters or reopen the issue.
+            let event_inserted = sqlx::query(
+                "INSERT INTO events (issue_id, event_id, payload, received_at) \
+                 VALUES (?, ?, ?, ?) ON CONFLICT(event_id) DO NOTHING",
+            )
+            .bind(row.id)
+            .bind(input.event_id)
+            .bind(input.payload)
+            .bind(now)
+            .execute(&mut *tx)
+            .await?
+            .rows_affected()
+                == 1;
+
+            let row = if !created && event_inserted {
+                if IssueStatus::from_db_str(&row.status) == IssueStatus::Resolved {
                     regressed = true;
                     sqlx::query(
                         "UPDATE issues \
@@ -445,31 +458,18 @@ impl Store {
                     .execute(&mut *tx)
                     .await?;
                 }
-            }
-
-            let row: IssueRow = sqlx::query_as(
-                "SELECT id, project, fingerprint, title, culprit, level, status, \
-                 event_count, first_seen, last_seen \
-                 FROM issues WHERE project = ? AND fingerprint = ?",
-            )
-            .bind(input.project)
-            .bind(fp_str)
-            .fetch_one(&mut *tx)
-            .await?;
-
-            // Append the raw event in the same tx so a partial commit can
-            // never leave an issue without its events. event_id + payload
-            // are pre-computed in digest::prepare so the single-writer
-            // transaction does no JSON serialization work.
-            sqlx::query(
-                "INSERT INTO events (issue_id, event_id, payload) VALUES (?, ?, ?) \
-                 ON CONFLICT(event_id) DO NOTHING",
-            )
-            .bind(row.id)
-            .bind(input.event_id)
-            .bind(input.payload)
-            .execute(&mut *tx)
-            .await?;
+                sqlx::query_as(
+                    "SELECT id, project, fingerprint, title, culprit, level, status, \
+                     event_count, first_seen, last_seen \
+                     FROM issues WHERE project = ? AND fingerprint = ?",
+                )
+                .bind(input.project)
+                .bind(fp_str)
+                .fetch_one(&mut *tx)
+                .await?
+            } else {
+                row
+            };
 
             results.push(UpsertResult {
                 issue: row.into(),

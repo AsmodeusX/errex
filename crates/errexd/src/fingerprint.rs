@@ -1,33 +1,66 @@
 //! Fingerprint derivation for grouping similar events.
 //!
-//! Strategy is deliberately naive for the scaffold: hash the exception type
-//! plus the topmost in-app frame (function + filename). Real Sentry-style
-//! grouping needs more nuance (module normalization, frame-skip rules,
-//! message templating), and that work belongs in a dedicated module.
-
-use std::collections::hash_map::DefaultHasher;
-use std::hash::{Hash, Hasher};
+//! Strategy is deliberately naive: hash the exception type plus the innermost
+//! in-app frame (function + filename), or the custom fingerprint the SDK sent.
+//! Hashing uses FNV-1a rather than `DefaultHasher`, whose output may change
+//! across Rust releases and would silently split persisted issues.
 
 use errex_proto::{Event, Fingerprint};
 
 pub fn derive(event: &Event) -> Fingerprint {
-    let mut h = DefaultHasher::new();
+    if let Some(custom) = event.fingerprint.as_ref().filter(|f| !f.is_empty()) {
+        let mut parts = vec!["custom".to_string()];
+        parts.extend(custom.iter().cloned());
+        return fingerprint_from(&parts);
+    }
 
-    if let Some(ex) = event.primary_exception() {
-        ex.ty.hash(&mut h);
-        if let Some(frame) = ex.first_frame() {
-            frame.function.hash(&mut h);
-            frame.filename.hash(&mut h);
-        }
-    } else if let Some(msg) = &event.message {
-        msg.hash(&mut h);
+    let message = event.message.as_deref().or_else(|| {
+        event
+            .logentry
+            .as_ref()
+            .and_then(|l| l.formatted.as_deref().or(l.message.as_deref()))
+    });
+
+    let parts: Vec<String> = if let Some(ex) = event.primary_exception() {
+        let frame = ex.stacktrace.as_ref().and_then(|s| {
+            s.frames
+                .iter()
+                .rev()
+                .find(|f| f.in_app == Some(true))
+                .or_else(|| s.frames.last())
+        });
+        vec![
+            "exc".into(),
+            ex.ty.clone().unwrap_or_default(),
+            frame.and_then(|f| f.function.clone()).unwrap_or_default(),
+            frame.and_then(|f| f.filename.clone()).unwrap_or_default(),
+        ]
+    } else if let Some(msg) = message {
+        vec!["msg".into(), msg.to_string()]
     } else {
         // Nothing distinguishing — fall back to event id so each event is its
         // own group rather than collapsing all unknown events together.
-        event.event_id.hash(&mut h);
-    }
+        vec!["id".into(), event.event_id.to_string()]
+    };
 
-    Fingerprint::new(format!("{:016x}", h.finish()))
+    fingerprint_from(&parts)
+}
+
+fn fingerprint_from(parts: &[String]) -> Fingerprint {
+    Fingerprint::new(format!("{:016x}", stable_hash(parts)))
+}
+
+fn stable_hash(parts: &[String]) -> u64 {
+    const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+    const FNV_PRIME: u64 = 0x0100_0000_01b3;
+    let mut h = FNV_OFFSET;
+    for part in parts {
+        for &b in part.as_bytes().iter().chain(std::iter::once(&0x1f)) {
+            h ^= u64::from(b);
+            h = h.wrapping_mul(FNV_PRIME);
+        }
+    }
+    h
 }
 
 #[cfg(test)]
@@ -81,6 +114,8 @@ mod tests {
             extra: None,
             user: None,
             request: None,
+            logentry: None,
+            fingerprint: None,
         }
     }
 
@@ -101,6 +136,8 @@ mod tests {
             extra: None,
             user: None,
             request: None,
+            logentry: None,
+            fingerprint: None,
         }
     }
 
@@ -121,6 +158,8 @@ mod tests {
             extra: None,
             user: None,
             request: None,
+            logentry: None,
+            fingerprint: None,
         }
     }
 
@@ -219,5 +258,57 @@ mod tests {
         let mut with_ex2 = ev_with_exception("E", "f", "a.js", 1);
         with_ex2.message = Some("changing message 2".into());
         assert_eq!(derive(&with_ex), derive(&with_ex2));
+    }
+
+    #[test]
+    fn custom_fingerprint_overrides_exception() {
+        let mut a = ev_with_exception("E", "f", "a.js", 1);
+        a.fingerprint = Some(vec!["checkout-timeout".into()]);
+        let mut b = ev_with_exception("Other", "g", "b.js", 2);
+        b.fingerprint = Some(vec!["checkout-timeout".into()]);
+        assert_eq!(derive(&a), derive(&b));
+    }
+
+    #[test]
+    fn logentry_message_groups_message_only_events() {
+        let mut a = ev_empty();
+        a.logentry = Some(errex_proto::LogEntry {
+            message: Some("cache miss".into()),
+            formatted: None,
+        });
+        let mut b = ev_empty();
+        b.logentry = Some(errex_proto::LogEntry {
+            message: Some("cache miss".into()),
+            formatted: None,
+        });
+        assert_eq!(derive(&a), derive(&b));
+    }
+
+    #[test]
+    fn prefers_innermost_in_app_frame() {
+        let mut a = ev_with_exception("E", "vendor_fn", "vendor.js", 1);
+        let frames = &mut a.exception.as_mut().unwrap().values[0]
+            .stacktrace
+            .as_mut()
+            .unwrap()
+            .frames;
+        frames.push(Frame {
+            filename: Some("app.js".into()),
+            function: Some("handler".into()),
+            module: None,
+            lineno: Some(9),
+            colno: None,
+            in_app: Some(true),
+        });
+        frames.push(Frame {
+            filename: Some("lib.js".into()),
+            function: Some("deep".into()),
+            module: None,
+            lineno: Some(3),
+            colno: None,
+            in_app: Some(false),
+        });
+        let b = ev_with_exception("E", "handler", "app.js", 9);
+        assert_eq!(derive(&a), derive(&b));
     }
 }

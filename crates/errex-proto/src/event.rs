@@ -40,6 +40,14 @@ where
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LogEntry {
+    #[serde(default)]
+    pub message: Option<String>,
+    #[serde(default)]
+    pub formatted: Option<String>,
+}
+
 /// A single error event coming from a Sentry-compatible SDK.
 ///
 /// We model only the fields the scaffold needs. Unknown fields are dropped
@@ -74,6 +82,12 @@ pub struct Event {
 
     #[serde(default)]
     pub message: Option<String>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub logentry: Option<LogEntry>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fingerprint: Option<Vec<String>>,
 
     #[serde(default)]
     pub exception: Option<ExceptionContainer>,
