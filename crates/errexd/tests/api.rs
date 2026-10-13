@@ -2405,3 +2405,44 @@ async fn health_returns_ok() {
     let v = body_json(res).await;
     assert_eq!(v.get("status").and_then(|s| s.as_str()), Some("ok"));
 }
+
+#[tokio::test]
+async fn ingest_accepts_gzip_envelope_that_expands_past_budget_share() {
+    // A ~4 MiB expanded envelope is charged at the full budget. The request
+    // must not hold its raw-body charge while waiting for that, or it can
+    // never be granted and the request hangs.
+    use flate2::write::GzEncoder;
+    use flate2::Compression;
+    use std::io::Write;
+
+    let (router, _store, _dir) = fixture_with_auth(false).await;
+    let now = chrono::Utc::now().to_rfc3339();
+    let message = "a".repeat(4 * 1024 * 1024);
+    let payload = format!(
+        "{{\"event_id\":\"00000000000000000000000000000002\",\"sent_at\":\"{now}\"}}\n\
+         {{\"type\":\"event\"}}\n\
+         {{\"timestamp\":\"{now}\",\"message\":\"{message}\"}}\n"
+    );
+    let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+    encoder.write_all(payload.as_bytes()).unwrap();
+    let gz = encoder.finish().unwrap();
+    assert!(
+        gz.len() < 1024 * 1024,
+        "compressed body must fit the raw limit"
+    );
+
+    let res = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        router.oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/anyproject/envelope/")
+                .body(Body::from(gz))
+                .unwrap(),
+        ),
+    )
+    .await
+    .expect("ingest must not hang on budget admission")
+    .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+}

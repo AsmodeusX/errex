@@ -1049,7 +1049,7 @@ async fn ingest_envelope(
         state.metrics.inc_rejected_rate_limit();
         return (StatusCode::TOO_MANY_REQUESTS, "rate limit exceeded").into_response();
     }
-    let mut budget = match state
+    let raw_charge = match state
         .ingest_budget
         .clone()
         .acquire_many_owned(budget_weight(body.len()))
@@ -1065,16 +1065,18 @@ async fn ingest_envelope(
             return (StatusCode::BAD_REQUEST, "invalid gzip").into_response();
         }
     };
-    match state
+    // Release the raw charge before asking for the expanded one. Holding both
+    // could request more than the whole budget while still holding part of it.
+    drop(raw_charge);
+    let budget = match state
         .ingest_budget
         .clone()
         .acquire_many_owned(budget_weight(raw.len().saturating_mul(EXPANSION_FACTOR)))
         .await
     {
-        Ok(expanded) => budget.merge(expanded),
+        Ok(permit) => Arc::new(permit),
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
-    }
-    let budget = Arc::new(budget);
+    };
 
     let events = match parse_envelope(&raw) {
         Ok(v) => v,
