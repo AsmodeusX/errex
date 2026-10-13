@@ -109,6 +109,10 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             "/api/:project/envelope/",
             post(ingest_envelope).layer(axum::extract::DefaultBodyLimit::max(1024 * 1024)),
         )
+        .route_layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            limit_inflight,
+        ))
         .layer(
             CorsLayer::new()
                 .allow_origin(tower_http::cors::Any)
@@ -1045,9 +1049,14 @@ async fn ingest_envelope(
         state.metrics.inc_rejected_rate_limit();
         return (StatusCode::TOO_MANY_REQUESTS, "rate limit exceeded").into_response();
     }
-    let _inflight = match state.ingest_inflight.clone().try_acquire_owned() {
+    let mut budget = match state
+        .ingest_budget
+        .clone()
+        .acquire_many_owned(budget_weight(body.len()))
+        .await
+    {
         Ok(permit) => permit,
-        Err(_) => return (StatusCode::SERVICE_UNAVAILABLE, "busy").into_response(),
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
     };
     let raw = match maybe_gunzip(&body) {
         Ok(v) => v,
@@ -1056,13 +1065,16 @@ async fn ingest_envelope(
             return (StatusCode::BAD_REQUEST, "invalid gzip").into_response();
         }
     };
-
-    let weight =
-        (raw.len().saturating_mul(EXPANSION_FACTOR) / 1024).clamp(1, INGEST_BUDGET_KIB) as u32;
-    let budget = match state.ingest_budget.clone().acquire_many_owned(weight).await {
-        Ok(permit) => Arc::new(permit),
+    match state
+        .ingest_budget
+        .clone()
+        .acquire_many_owned(budget_weight(raw.len().saturating_mul(EXPANSION_FACTOR)))
+        .await
+    {
+        Ok(expanded) => budget.merge(expanded),
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
-    };
+    }
+    let budget = Arc::new(budget);
 
     let events = match parse_envelope(&raw) {
         Ok(v) => v,
@@ -1106,10 +1118,29 @@ async fn ingest_envelope(
 /// outliers while keeping a gzip bomb from expanding a 2 MiB body into
 /// gigabytes and OOM-ing the daemon on a 1 GB VM.
 const MAX_DECOMPRESSED: usize = 8 * 1024 * 1024;
-/// Parsed events occupy roughly this multiple of their wire size.
-const EXPANSION_FACTOR: usize = 4;
+/// Parsed JSON can occupy about 16x its wire size (numeric-heavy payloads
+/// were measured at that ratio), so expanded envelopes are charged at this rate.
+const EXPANSION_FACTOR: usize = 16;
 /// Total memory budget for expanded envelopes in flight, in KiB (64 MiB).
 pub const INGEST_BUDGET_KIB: usize = 64 * 1024;
+
+fn budget_weight(bytes: usize) -> u32 {
+    bytes.div_ceil(1024).clamp(1, INGEST_BUDGET_KIB) as u32
+}
+
+/// Holds an in-flight slot for the whole request, including the body read, so
+/// queued requests keep their bodies unread.
+async fn limit_inflight(
+    State(state): State<Arc<AppState>>,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    let _permit = match state.ingest_inflight.clone().acquire_owned().await {
+        Ok(permit) => permit,
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    };
+    next.run(req).await
+}
 
 /// Detect gzip via magic bytes rather than trusting `Content-Encoding`. Sentry
 /// SDKs are inconsistent about setting the header, and the cost of sniffing

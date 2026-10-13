@@ -11,13 +11,17 @@
 //! redirect machinery was dead weight at idle for the fire-and-forget JSON
 //! POSTs we actually issue.
 
-use std::net::IpAddr;
+use std::future::Future;
+use std::net::{IpAddr, SocketAddr};
+use std::pin::Pin;
+use std::task::{Context, Poll};
 use std::time::Duration;
 
 use http_body_util::{BodyExt, Full, Limited};
 use hyper::body::Bytes;
 use hyper::{Method, Request};
 use hyper_rustls::{HttpsConnector, HttpsConnectorBuilder};
+use hyper_util::client::legacy::connect::dns::Name;
 use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::client::legacy::Client;
 use hyper_util::rt::TokioExecutor;
@@ -29,17 +33,17 @@ use tokio::sync::mpsc;
 
 use crate::store::Store;
 
-type WebhookClient = Client<HttpsConnector<HttpConnector>, Full<Bytes>>;
+type WebhookClient = Client<HttpsConnector<HttpConnector<CheckedResolver>>, Full<Bytes>>;
 
 fn build_client() -> WebhookClient {
-    let mut http = HttpConnector::new();
+    let mut http = HttpConnector::new_with_resolver(CheckedResolver);
     // Bound the TCP handshake — webhooks are not a load-bearing path,
     // so a slow connect must not stall the task. Mirrors the prior
     // `reqwest::ClientBuilder::connect_timeout(2s)`.
     http.set_connect_timeout(Some(Duration::from_secs(2)));
     http.enforce_http(false);
 
-    let https: HttpsConnector<HttpConnector> = HttpsConnectorBuilder::new()
+    let https: HttpsConnector<HttpConnector<CheckedResolver>> = HttpsConnectorBuilder::new()
         .with_webpki_roots()
         .https_or_http()
         .enable_http1()
@@ -69,7 +73,6 @@ async fn post_json(client: &WebhookClient, url: &str, body: &Value) -> Result<u1
         .map_err(|e| format!("build request: {e}"))?;
 
     let exchange = async {
-        ensure_public_destination(url).await?;
         let resp = client
             .request(req)
             .await
@@ -86,25 +89,35 @@ async fn post_json(client: &WebhookClient, url: &str, body: &Value) -> Result<u1
         .unwrap_or_else(|_| Err("timeout".into()))
 }
 
-/// Re-checks the destination at delivery time, so a name that resolves to a
-/// private address after validation is still refused. Still racy against a
-/// rebinding resolver that changes answers between this lookup and connect.
-#[cfg(not(test))]
-async fn ensure_public_destination(url: &str) -> Result<(), String> {
-    let parsed = Url::parse(url).map_err(|e| format!("parse url: {e}"))?;
-    let host = parsed.host_str().ok_or("missing host")?;
-    let host = host.trim_start_matches('[').trim_end_matches(']');
-    let port = parsed.port_or_known_default().ok_or("unknown port")?;
-    let addrs = tokio::net::lookup_host((host, port))
-        .await
-        .map_err(|e| format!("resolve: {e}"))?;
-    reject_private_addrs(addrs.map(|a| a.ip()))
-}
+/// Test mock servers listen on loopback, so tests allow private destinations.
+const ALLOW_PRIVATE_DESTINATIONS: bool = cfg!(test);
 
-/// Test mock servers listen on loopback, so tests skip the resolution check.
-#[cfg(test)]
-async fn ensure_public_destination(_url: &str) -> Result<(), String> {
-    Ok(())
+/// Resolves webhook hosts and refuses the lookup if any answer is private.
+/// The connector dials only the addresses returned here, so a DNS answer
+/// cannot change between the check and the connection.
+#[derive(Clone)]
+struct CheckedResolver;
+
+impl tower_service::Service<Name> for CheckedResolver {
+    type Response = std::vec::IntoIter<SocketAddr>;
+    type Error = std::io::Error;
+    type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
+
+    fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn call(&mut self, name: Name) -> Self::Future {
+        Box::pin(async move {
+            let addrs: Vec<SocketAddr> =
+                tokio::net::lookup_host((name.as_str(), 0)).await?.collect();
+            if !ALLOW_PRIVATE_DESTINATIONS {
+                reject_private_addrs(addrs.iter().map(SocketAddr::ip))
+                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::PermissionDenied, e))?;
+            }
+            Ok(addrs.into_iter())
+        })
+    }
 }
 
 fn reject_private_addrs(ips: impl Iterator<Item = IpAddr>) -> Result<(), String> {
@@ -131,8 +144,8 @@ fn reject_private_addrs(ips: impl Iterator<Item = IpAddr>) -> Result<(), String>
 ///     refused (`localhost`, `.local`, `.internal`, `.lan`, `.intranet`,
 ///     `.corp`, `.home.arpa`)
 ///
-/// Names are checked again at delivery time (see `ensure_public_destination`),
-/// which catches a public name that resolves to a private address.
+/// Names are checked again at delivery time by `CheckedResolver`, which
+/// catches a public name that resolves to a private address.
 pub fn validate_url(raw: &str) -> Result<(), &'static str> {
     let url = Url::parse(raw).map_err(|_| "invalid url")?;
     match url.scheme() {

@@ -43,6 +43,7 @@ ERREX_DATA_DIR="$DATA" \
 ERREX_LOG_LEVEL=warn \
 ERREX_RATE_LIMIT_PER_MIN=0 \
 ERREX_REQUIRE_AUTH=false \
+ERREX_ADMIN_TOKEN=bench-setup-token \
   taskset -c "$PIN_CPU" "$BIN" --http-port "$PORT" --mcp-port "$MCP_PORT" >/dev/null 2>&1 &
 PID=$!
 
@@ -57,6 +58,18 @@ comm="$(ps -o comm= -p "$PID" 2>/dev/null | tr -d ' ')"
 if [[ "$comm" != "errexd" ]]; then
   resolved="$(pgrep -fn "$BIN" 2>/dev/null || true)"
   if [[ -n "$resolved" ]]; then PID="$resolved"; fi
+fi
+
+# Create the benchmark admin and capture its session cookie, so WebSocket
+# subscribers can complete the upgrade.
+SESSION="$(curl -s -D - -o /dev/null \
+  -H 'content-type: application/json' \
+  -d '{"token":"bench-setup-token","username":"bench","password":"Bench-Pass-2026-Long-Phrase!"}' \
+  "http://127.0.0.1:$PORT/api/auth/setup" \
+  | tr -d '\r' | awk -F'[=;]' 'tolower($1) ~ /set-cookie/ {print $2}')"
+if [[ -z "$SESSION" ]]; then
+  echo '{"error":"setup failed: no session cookie"}' >&2
+  exit 1
 fi
 
 # Sample RSS for $1 seconds, print mean+max in kB.
@@ -88,6 +101,7 @@ run_load() {
     --out "$out" \
     --rps "$rps" --workers 64 --duration-secs "$dur" \
     --cardinality 50 --frames 8 --projects 4 --ws-subscribers 4 \
+    --session-cookie "errex_session=$SESSION" \
     >/dev/null
   cat "$out"
   rm -f "$out"

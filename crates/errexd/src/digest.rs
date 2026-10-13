@@ -55,12 +55,23 @@ pub struct IngestEvent {
 }
 
 /// Build a digest-ready record from a raw `Event` parsed off the wire.
+/// Issue titles and culprits are SDK-controlled and get listed in bulk, so
+/// they are capped to keep snapshot responses bounded.
+const MAX_LABEL_CHARS: usize = 512;
+
+fn truncate_chars(mut s: String, max: usize) -> String {
+    if let Some((idx, _)) = s.char_indices().nth(max) {
+        s.truncate(idx);
+    }
+    s
+}
+
 /// Cheap (small string allocs + one fingerprint hash + one JSON
 /// serialize); intentionally runs in the HTTP handler instead of the
 /// digest task so the digest's only blocking work is SQLite I/O.
 pub fn prepare(project: String, event: Event) -> IngestEvent {
     let fingerprint = fingerprint::derive(&event);
-    let title = event.title();
+    let title = truncate_chars(event.title(), MAX_LABEL_CHARS);
     let level = event.level.map(level_str);
 
     let exception_type = event
@@ -84,7 +95,7 @@ pub fn prepare(project: String, event: Event) -> IngestEvent {
         .map(|f| {
             let func = f.function.as_deref().unwrap_or("?");
             let file = f.filename.as_deref().unwrap_or("?");
-            format!("{func} in {file}")
+            truncate_chars(format!("{func} in {file}"), MAX_LABEL_CHARS)
         });
 
     let event_id = event.event_id.simple().to_string();

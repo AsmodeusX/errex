@@ -21,6 +21,7 @@ tokio-tungstenite = { workspace = true }
 # `tower` only via `tower::ServiceExt::oneshot` in tests — kept in
 # dev-dependencies but not in the production build.
 tower-http = { workspace = true }
+tower-service = "0.3"
 
 rust-embed = { workspace = true }
 

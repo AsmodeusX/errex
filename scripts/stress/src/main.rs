@@ -57,6 +57,9 @@ struct Cli {
     /// Number of WebSocket subscribers to attach.
     #[arg(long, default_value_t = 4)]
     ws_subscribers: usize,
+    /// Session cookie (`errex_session=…`) sent with WebSocket upgrades.
+    #[arg(long)]
+    session_cookie: Option<String>,
     /// PID of daemon to sample RSS from (omit to skip RSS sampling).
     #[arg(long)]
     daemon_pid: Option<u32>,
@@ -351,8 +354,9 @@ async fn main() -> anyhow::Result<()> {
         let counters = counters.clone();
         let hist = ws_lag_hist.clone();
         let stop = stop.clone();
+        let cookie = cli.session_cookie.clone();
         ws_handles.push(tokio::spawn(async move {
-            ws_subscriber(i, url, counters, hist, stop).await;
+            ws_subscriber(i, url, cookie, counters, hist, stop).await;
         }));
     }
 
@@ -583,11 +587,25 @@ async fn worker_loop(
 async fn ws_subscriber(
     id: usize,
     url: String,
+    cookie: Option<String>,
     counters: Arc<Counters>,
     hist: Arc<Mutex<Histogram<u64>>>,
     stop: Arc<AtomicBool>,
 ) {
-    let connect = match tokio_tungstenite::connect_async(&url).await {
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+    let mut request = match url.as_str().into_client_request() {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("[ws#{id}] bad request: {e}");
+            return;
+        }
+    };
+    if let Some(cookie) = cookie.as_deref() {
+        if let Ok(value) = cookie.parse() {
+            request.headers_mut().insert("cookie", value);
+        }
+    }
+    let connect = match tokio_tungstenite::connect_async(request).await {
         Ok(x) => x,
         Err(e) => {
             eprintln!("[ws#{id}] connect failed: {e}");

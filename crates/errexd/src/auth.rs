@@ -377,6 +377,24 @@ pub async fn handle_login(
         .store
         .create_session(&id, &username, Some(&ip), ua.as_deref())
         .await?;
+    // A password reset or deactivation that committed while this login was in
+    // flight may have missed the session we just created. Re-check after the
+    // insert and revoke if the credential or the account changed.
+    let still_current = state
+        .store
+        .get_user_password_hash(&username)
+        .await?
+        .as_deref()
+        == Some(stored_hash.as_str())
+        && state
+            .store
+            .get_user(&username)
+            .await?
+            .is_some_and(|u| u.deactivated_at.is_none());
+    if !still_current {
+        state.store.revoke_session(&id).await.ok();
+        return Ok((StatusCode::UNAUTHORIZED, "invalid credentials").into_response());
+    }
     let user = state
         .store
         .get_user(&username)
