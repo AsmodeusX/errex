@@ -7,21 +7,28 @@
 
 use errex_proto::{Event, Fingerprint};
 
+const DEFAULT_TOKEN: &str = "{{ default }}";
+
 pub fn derive(event: &Event) -> Fingerprint {
-    if let Some(custom) = event.fingerprint.as_ref().filter(|f| !f.is_empty()) {
-        let mut parts = vec!["custom".to_string()];
-        parts.extend(custom.iter().cloned());
-        return fingerprint_from(&parts);
-    }
+    let default = default_parts(event);
+    let parts = match event.fingerprint.as_deref().filter(|f| !f.is_empty()) {
+        Some(custom) => custom
+            .iter()
+            .flat_map(|part| {
+                if part == DEFAULT_TOKEN {
+                    default.clone()
+                } else {
+                    vec![part.clone()]
+                }
+            })
+            .collect(),
+        None => default,
+    };
+    fingerprint_from(&parts)
+}
 
-    let message = event.message.as_deref().or_else(|| {
-        event
-            .logentry
-            .as_ref()
-            .and_then(|l| l.formatted.as_deref().or(l.message.as_deref()))
-    });
-
-    let parts: Vec<String> = if let Some(ex) = event.primary_exception() {
+fn default_parts(event: &Event) -> Vec<String> {
+    if let Some(ex) = event.primary_exception() {
         let frame = ex.stacktrace.as_ref().and_then(|s| {
             s.frames
                 .iter()
@@ -29,36 +36,50 @@ pub fn derive(event: &Event) -> Fingerprint {
                 .find(|f| f.in_app == Some(true))
                 .or_else(|| s.frames.last())
         });
-        vec![
+        return vec![
             "exc".into(),
             ex.ty.clone().unwrap_or_default(),
             frame.and_then(|f| f.function.clone()).unwrap_or_default(),
             frame.and_then(|f| f.filename.clone()).unwrap_or_default(),
-        ]
-    } else if let Some(msg) = message {
-        vec!["msg".into(), msg.to_string()]
-    } else {
+        ];
+    }
+
+    // Prefer the unformatted template so the same log line with different
+    // parameters still groups together.
+    let message = event
+        .logentry
+        .as_ref()
+        .and_then(|l| l.message.as_deref())
+        .or(event.message.as_deref())
+        .or_else(|| event.logentry.as_ref().and_then(|l| l.formatted.as_deref()));
+
+    match message {
+        Some(msg) => vec!["msg".into(), msg.to_string()],
         // Nothing distinguishing — fall back to event id so each event is its
         // own group rather than collapsing all unknown events together.
-        vec!["id".into(), event.event_id.to_string()]
-    };
-
-    fingerprint_from(&parts)
+        None => vec!["id".into(), event.event_id.to_string()],
+    }
 }
 
 fn fingerprint_from(parts: &[String]) -> Fingerprint {
     Fingerprint::new(format!("{:016x}", stable_hash(parts)))
 }
 
+// Each part is length-prefixed so no choice of part contents can make two
+// different part lists hash the same input.
 fn stable_hash(parts: &[String]) -> u64 {
     const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
     const FNV_PRIME: u64 = 0x0100_0000_01b3;
     let mut h = FNV_OFFSET;
-    for part in parts {
-        for &b in part.as_bytes().iter().chain(std::iter::once(&0x1f)) {
+    let mut feed = |bytes: &[u8]| {
+        for &b in bytes {
             h ^= u64::from(b);
             h = h.wrapping_mul(FNV_PRIME);
         }
+    };
+    for part in parts {
+        feed(&(part.len() as u64).to_le_bytes());
+        feed(part.as_bytes());
     }
     h
 }
@@ -309,6 +330,44 @@ mod tests {
             in_app: Some(false),
         });
         let b = ev_with_exception("E", "handler", "app.js", 9);
+        assert_eq!(derive(&a), derive(&b));
+    }
+
+    #[test]
+    fn default_token_expands_to_default_grouping() {
+        let mut a = ev_with_exception("E", "f", "a.js", 1);
+        a.fingerprint = Some(vec!["{{ default }}".into(), "tenant-1".into()]);
+        let mut b = ev_with_exception("Other", "g", "b.js", 2);
+        b.fingerprint = Some(vec!["{{ default }}".into(), "tenant-1".into()]);
+        assert_ne!(derive(&a), derive(&b));
+
+        let plain = ev_with_exception("E", "f", "a.js", 1);
+        let mut expanded = ev_with_exception("E", "f", "a.js", 1);
+        expanded.fingerprint = Some(vec!["{{ default }}".into()]);
+        assert_eq!(derive(&plain), derive(&expanded));
+    }
+
+    #[test]
+    fn separator_characters_cannot_collide_parts() {
+        let mut a = ev_empty();
+        a.fingerprint = Some(vec!["a:b".into(), "c".into()]);
+        let mut b = ev_empty();
+        b.fingerprint = Some(vec!["a".into(), "b:c".into()]);
+        assert_ne!(derive(&a), derive(&b));
+    }
+
+    #[test]
+    fn formatted_log_params_group_by_template() {
+        let mut a = ev_empty();
+        a.logentry = Some(errex_proto::LogEntry {
+            message: Some("user %s logged in".into()),
+            formatted: Some("user alice logged in".into()),
+        });
+        let mut b = ev_empty();
+        b.logentry = Some(errex_proto::LogEntry {
+            message: Some("user %s logged in".into()),
+            formatted: Some("user bob logged in".into()),
+        });
         assert_eq!(derive(&a), derive(&b));
     }
 }

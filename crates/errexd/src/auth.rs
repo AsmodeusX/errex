@@ -147,7 +147,17 @@ pub struct AuthContext {
 }
 
 /// Resolves the current session and bumps `last_seen_at` (sliding expiry).
-/// Returns 401 for: no cookie, unknown cookie, deactivated user.
+/// Sessions unused for this many days are treated as expired.
+pub const SESSION_IDLE_DAYS: i64 = 30;
+
+/// Verified against when the username is unknown, so a missing user costs the
+/// same argon2 work as a wrong password.
+fn dummy_password_hash() -> &'static str {
+    static DUMMY: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    DUMMY.get_or_init(|| crypto::hash_password("unused-placeholder").unwrap_or_default())
+}
+
+/// Returns 401 for: no cookie, unknown cookie, deactivated user, idle session.
 #[allow(clippy::result_large_err)] // mirrors check_admin's pattern; Response is small enough
 pub async fn require_auth(state: &AppState, headers: &HeaderMap) -> Result<AuthContext, Response> {
     let Some(id) = extract_session_id(headers) else {
@@ -157,12 +167,14 @@ pub async fn require_auth(state: &AppState, headers: &HeaderMap) -> Result<AuthC
         tracing::error!(%err, "session lookup failed");
         (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response()
     })?;
-    let Some((session, role, _deactivated)) = lookup else {
-        // The query already filters deactivated users (sessions cascade on
-        // deactivation), so reaching here for a missing row is the normal
-        // "expired/revoked/never-existed" path.
+    let Some((session, role, deactivated)) = lookup else {
         return Err((StatusCode::UNAUTHORIZED, "session invalid").into_response());
     };
+    let idle = Utc::now() - session.last_seen_at;
+    if deactivated || idle > chrono::Duration::days(SESSION_IDLE_DAYS) {
+        state.store.revoke_session(&session.id).await.ok();
+        return Err((StatusCode::UNAUTHORIZED, "session invalid").into_response());
+    }
     // Sliding expiry: every authenticated request advances the window.
     state.store.touch_session(&session.id).await;
     Ok(AuthContext { session, role })
@@ -257,10 +269,14 @@ pub async fn handle_setup(
             return Ok((StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response());
         }
     };
-    state
+    if state
         .store
-        .create_user(username, &hash, Role::Admin)
-        .await?;
+        .create_first_user(username, &hash, Role::Admin)
+        .await?
+        .is_none()
+    {
+        return Ok((StatusCode::CONFLICT, "setup already complete").into_response());
+    }
 
     // Sign the operator in immediately — they just proved they have host
     // access AND chose a password; making them re-type it would be silly.
@@ -331,14 +347,7 @@ pub async fn handle_login(
         .store
         .get_user_password_hash(&username)
         .await?
-        .unwrap_or_else(|| {
-            // Hash of a random impossible password, generated once at boot.
-            // Pre-computed in OnceLock would be faster but the per-failure
-            // cost is bounded by the lockout above.
-            "$argon2id$v=19$m=19456,t=2,p=1$abcdefghijklmnopqrstuv$\
-             aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-                .to_string()
-        });
+        .unwrap_or_else(|| dummy_password_hash().to_string());
     let ok = crypto::verify_password(&stored_hash, &body.password);
     let user_exists_active = state
         .store

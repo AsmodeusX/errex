@@ -107,7 +107,7 @@ pub async fn run_one_tick(store: &Store, boot_days: u32) {
     // expiry. The browser would refuse the cookie at this point anyway,
     // but evicting the row keeps the table from accumulating ghost
     // sessions for users who just closed their tab and never came back.
-    let session_cutoff = Utc::now() - chrono::Duration::days(30);
+    let session_cutoff = Utc::now() - chrono::Duration::days(crate::auth::SESSION_IDLE_DAYS);
     match store.purge_sessions_idle_since(session_cutoff).await {
         Ok(0) => {}
         Ok(n) => tracing::debug!(deleted = n, "retention: purged idle sessions"),

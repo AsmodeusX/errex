@@ -76,9 +76,12 @@ pub struct AppState {
     /// Live handle to the webhook sender so `/metrics` can report depth
     /// without an extra plumbed counter. Not used to send.
     pub webhook_sender: tokio::sync::mpsc::Sender<crate::webhook::Trigger>,
-    /// Bounds how many envelopes are decompressed and parsed at once, so
-    /// peak memory is a function of this limit rather than of request count.
-    pub ingest_slots: Arc<tokio::sync::Semaphore>,
+    /// Caps concurrent ingest requests, bounding the raw bodies held while
+    /// waiting for memory budget.
+    pub ingest_inflight: Arc<tokio::sync::Semaphore>,
+    /// Byte budget (1 KiB permits) for expanded envelopes in flight, released
+    /// when the digest task persists their events.
+    pub ingest_budget: Arc<tokio::sync::Semaphore>,
 }
 
 /// Build the API router without binding a listener. Extracted so tests can
@@ -1042,9 +1045,9 @@ async fn ingest_envelope(
         state.metrics.inc_rejected_rate_limit();
         return (StatusCode::TOO_MANY_REQUESTS, "rate limit exceeded").into_response();
     }
-    let _slot = match state.ingest_slots.acquire().await {
+    let _inflight = match state.ingest_inflight.clone().try_acquire_owned() {
         Ok(permit) => permit,
-        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+        Err(_) => return (StatusCode::SERVICE_UNAVAILABLE, "busy").into_response(),
     };
     let raw = match maybe_gunzip(&body) {
         Ok(v) => v,
@@ -1052,6 +1055,13 @@ async fn ingest_envelope(
             tracing::warn!(%err, "ingest: failed to gunzip envelope");
             return (StatusCode::BAD_REQUEST, "invalid gzip").into_response();
         }
+    };
+
+    let weight =
+        (raw.len().saturating_mul(EXPANSION_FACTOR) / 1024).clamp(1, INGEST_BUDGET_KIB) as u32;
+    let budget = match state.ingest_budget.clone().acquire_many_owned(weight).await {
+        Ok(permit) => Arc::new(permit),
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
     };
 
     let events = match parse_envelope(&raw) {
@@ -1071,7 +1081,10 @@ async fn ingest_envelope(
     }
 
     for event in events {
-        let rec = crate::digest::prepare(project.clone(), event);
+        let rec = crate::digest::IngestEvent {
+            _budget: Some(budget.clone()),
+            ..crate::digest::prepare(project.clone(), event)
+        };
         if state.events.send(rec).await.is_err() {
             // Digest receiver gone = shutting down. Don't bump telemetry
             // for a request we didn't actually accept.
@@ -1093,6 +1106,10 @@ async fn ingest_envelope(
 /// outliers while keeping a gzip bomb from expanding a 2 MiB body into
 /// gigabytes and OOM-ing the daemon on a 1 GB VM.
 const MAX_DECOMPRESSED: usize = 8 * 1024 * 1024;
+/// Parsed events occupy roughly this multiple of their wire size.
+const EXPANSION_FACTOR: usize = 4;
+/// Total memory budget for expanded envelopes in flight, in KiB (64 MiB).
+pub const INGEST_BUDGET_KIB: usize = 64 * 1024;
 
 /// Detect gzip via magic bytes rather than trusting `Content-Encoding`. Sentry
 /// SDKs are inconsistent about setting the header, and the cost of sniffing

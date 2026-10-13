@@ -124,7 +124,8 @@ async fn fixture_full(
         metrics: Arc::new(metrics::Metrics::new()),
         webhook_capacity: 8,
         webhook_sender: webhook_tx,
-        ingest_slots: Arc::new(tokio::sync::Semaphore::new(8)),
+        ingest_inflight: Arc::new(tokio::sync::Semaphore::new(128)),
+        ingest_budget: Arc::new(tokio::sync::Semaphore::new(ingest::INGEST_BUDGET_KIB)),
     });
     let router = ingest::build_router(state);
     tokio::spawn(async move {

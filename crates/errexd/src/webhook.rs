@@ -14,7 +14,7 @@
 use std::net::IpAddr;
 use std::time::Duration;
 
-use http_body_util::{BodyExt, Full};
+use http_body_util::{BodyExt, Full, Limited};
 use hyper::body::Bytes;
 use hyper::{Method, Request};
 use hyper_rustls::{HttpsConnector, HttpsConnectorBuilder};
@@ -55,6 +55,9 @@ fn build_client() -> WebhookClient {
 /// where 10 s is generous; anything slower is failing somewhere.
 const SEND_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Response bytes read from a webhook endpoint before giving up on the body.
+const MAX_RESPONSE_BYTES: usize = 64 * 1024;
+
 async fn post_json(client: &WebhookClient, url: &str, body: &Value) -> Result<u16, String> {
     let body_bytes = serde_json::to_vec(body).map_err(|e| format!("serialize body: {e}"))?;
     let req = Request::builder()
@@ -65,17 +68,52 @@ async fn post_json(client: &WebhookClient, url: &str, body: &Value) -> Result<u1
         .body(Full::new(Bytes::from(body_bytes)))
         .map_err(|e| format!("build request: {e}"))?;
 
-    let send = client.request(req);
-    let resp = match tokio::time::timeout(SEND_TIMEOUT, send).await {
-        Ok(Ok(r)) => r,
-        Ok(Err(e)) => return Err(format!("send: {e}")),
-        Err(_) => return Err("timeout".into()),
+    let exchange = async {
+        ensure_public_destination(url).await?;
+        let resp = client
+            .request(req)
+            .await
+            .map_err(|e| format!("send: {e}"))?;
+        let status = resp.status().as_u16();
+        // Drain for connection reuse. Best-effort — body content is never surfaced.
+        let _ = Limited::new(resp.into_body(), MAX_RESPONSE_BYTES)
+            .collect()
+            .await;
+        Ok(status)
     };
-    let status = resp.status().as_u16();
-    // Drain the body so the connection can be reused. Best-effort —
-    // we don't surface body content anywhere.
-    let _ = resp.into_body().collect().await;
-    Ok(status)
+    tokio::time::timeout(SEND_TIMEOUT, exchange)
+        .await
+        .unwrap_or_else(|_| Err("timeout".into()))
+}
+
+/// Re-checks the destination at delivery time, so a name that resolves to a
+/// private address after validation is still refused. Still racy against a
+/// rebinding resolver that changes answers between this lookup and connect.
+#[cfg(not(test))]
+async fn ensure_public_destination(url: &str) -> Result<(), String> {
+    let parsed = Url::parse(url).map_err(|e| format!("parse url: {e}"))?;
+    let host = parsed.host_str().ok_or("missing host")?;
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    let port = parsed.port_or_known_default().ok_or("unknown port")?;
+    let addrs = tokio::net::lookup_host((host, port))
+        .await
+        .map_err(|e| format!("resolve: {e}"))?;
+    reject_private_addrs(addrs.map(|a| a.ip()))
+}
+
+/// Test mock servers listen on loopback, so tests skip the resolution check.
+#[cfg(test)]
+async fn ensure_public_destination(_url: &str) -> Result<(), String> {
+    Ok(())
+}
+
+fn reject_private_addrs(ips: impl Iterator<Item = IpAddr>) -> Result<(), String> {
+    for ip in ips {
+        if ip_is_private_or_local(ip) {
+            return Err("destination resolves to a private address".into());
+        }
+    }
+    Ok(())
 }
 
 /// Validate a configured webhook URL before storing it. The webhook task
@@ -93,10 +131,8 @@ async fn post_json(client: &WebhookClient, url: &str, body: &Value) -> Result<u1
 ///     refused (`localhost`, `.local`, `.internal`, `.lan`, `.intranet`,
 ///     `.corp`, `.home.arpa`)
 ///
-/// Known limitation: a public hostname whose authoritative DNS returns
-/// an RFC1918 address (DNS rebinding) still slips through this check.
-/// Mitigation belongs in the delivery path (custom resolver pinning the
-/// validated IP) — flagged for follow-up.
+/// Names are checked again at delivery time (see `ensure_public_destination`),
+/// which catches a public name that resolves to a private address.
 pub fn validate_url(raw: &str) -> Result<(), &'static str> {
     let url = Url::parse(raw).map_err(|_| "invalid url")?;
     match url.scheme() {
@@ -116,7 +152,7 @@ pub fn validate_url(raw: &str) -> Result<(), &'static str> {
         }
         return Ok(());
     }
-    let lower = host.to_ascii_lowercase();
+    let lower = host.trim_end_matches('.').to_ascii_lowercase();
     if lower == "localhost" || hostname_in_internal_zone(&lower) {
         return Err("loopback / internal-zone hostnames not allowed");
     }
@@ -149,6 +185,9 @@ fn ip_is_private_or_local(ip: IpAddr) -> bool {
                 || (v4.octets()[0] == 100 && (v4.octets()[1] & 0b1100_0000) == 64)
         }
         IpAddr::V6(v6) => {
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                return ip_is_private_or_local(IpAddr::V4(v4));
+            }
             let segs = v6.segments();
             v6.is_loopback()
                 || v6.is_unspecified()
@@ -673,5 +712,22 @@ mod tests {
         drop(tx);
         let _ = task.await;
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod hardening_tests {
+    use super::*;
+
+    #[test]
+    fn rejects_mapped_loopback_and_trailing_dot_hosts() {
+        assert!(validate_url("http://[::ffff:127.0.0.1]/hook").is_err());
+        assert!(validate_url("http://localhost./hook").is_err());
+    }
+
+    #[test]
+    fn refuses_resolved_private_addresses() {
+        assert!(reject_private_addrs(["10.0.0.5".parse().unwrap()].into_iter()).is_err());
+        assert!(reject_private_addrs(["93.184.216.34".parse().unwrap()].into_iter()).is_ok());
     }
 }

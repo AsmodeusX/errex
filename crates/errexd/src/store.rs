@@ -6,6 +6,9 @@ use serde::{Deserialize, Serialize};
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous};
 use sqlx::SqlitePool;
 
+/// Upper bound on issues returned by one list or snapshot query.
+const ISSUE_LIST_LIMIT: i64 = 1000;
+
 use crate::error::DaemonError;
 
 /// JSON shape returned by `/api/projects`. Lives next to the query that
@@ -388,6 +391,28 @@ impl Store {
             // `to_rfc3339()` produces. SQLite still stores ISO-8601 TEXT.
             let now = input.now;
 
+            let replayed_issue: Option<i64> =
+                sqlx::query_scalar("SELECT issue_id FROM events WHERE event_id = ?")
+                    .bind(input.event_id)
+                    .fetch_optional(&mut *tx)
+                    .await?;
+            if let Some(issue_id) = replayed_issue {
+                let row: IssueRow = sqlx::query_as(
+                    "SELECT id, project, fingerprint, title, culprit, level, status, \
+                     event_count, first_seen, last_seen \
+                     FROM issues WHERE id = ?",
+                )
+                .bind(issue_id)
+                .fetch_one(&mut *tx)
+                .await?;
+                results.push(UpsertResult {
+                    issue: row.into(),
+                    created: false,
+                    regressed: false,
+                });
+                continue;
+            }
+
             let inserted = sqlx::query(
                 "INSERT INTO issues (project, fingerprint, title, culprit, level, status, \
                  event_count, first_seen, last_seen) \
@@ -435,38 +460,25 @@ impl Store {
                 == 1;
 
             let row = if !created && event_inserted {
-                if IssueStatus::from_db_str(&row.status) == IssueStatus::Resolved {
-                    regressed = true;
-                    sqlx::query(
-                        "UPDATE issues \
-                         SET event_count = event_count + 1, last_seen = ?, status = 'unresolved' \
-                         WHERE project = ? AND fingerprint = ?",
-                    )
-                    .bind(now)
-                    .bind(input.project)
-                    .bind(fp_str)
-                    .execute(&mut *tx)
-                    .await?;
+                let previously_resolved =
+                    IssueStatus::from_db_str(&row.status) == IssueStatus::Resolved;
+                regressed = previously_resolved;
+                let sql = if previously_resolved {
+                    "UPDATE issues SET event_count = event_count + 1, last_seen = ?, \
+                     status = 'unresolved' WHERE id = ? \
+                     RETURNING id, project, fingerprint, title, culprit, level, status, \
+                     event_count, first_seen, last_seen"
                 } else {
-                    sqlx::query(
-                        "UPDATE issues SET event_count = event_count + 1, last_seen = ? \
-                         WHERE project = ? AND fingerprint = ?",
-                    )
+                    "UPDATE issues SET event_count = event_count + 1, last_seen = ? \
+                     WHERE id = ? \
+                     RETURNING id, project, fingerprint, title, culprit, level, status, \
+                     event_count, first_seen, last_seen"
+                };
+                sqlx::query_as(sql)
                     .bind(now)
-                    .bind(input.project)
-                    .bind(fp_str)
-                    .execute(&mut *tx)
-                    .await?;
-                }
-                sqlx::query_as(
-                    "SELECT id, project, fingerprint, title, culprit, level, status, \
-                     event_count, first_seen, last_seen \
-                     FROM issues WHERE project = ? AND fingerprint = ?",
-                )
-                .bind(input.project)
-                .bind(fp_str)
-                .fetch_one(&mut *tx)
-                .await?
+                    .bind(row.id)
+                    .fetch_one(&mut *tx)
+                    .await?
             } else {
                 row
             };
@@ -521,12 +533,13 @@ impl Store {
     pub async fn insert_event(&self, issue_id: i64, event: &Event) -> Result<(), DaemonError> {
         let payload = serde_json::to_string(event)?;
         sqlx::query(
-            "INSERT INTO events (issue_id, event_id, payload) VALUES (?, ?, ?) \
+            "INSERT INTO events (issue_id, event_id, payload, received_at) VALUES (?, ?, ?, ?) \
              ON CONFLICT(event_id) DO NOTHING",
         )
         .bind(issue_id)
         .bind(event.event_id.to_string())
         .bind(payload)
+        .bind(Utc::now())
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -538,8 +551,9 @@ impl Store {
         let rows: Vec<IssueRow> = sqlx::query_as(
             "SELECT id, project, fingerprint, title, culprit, level, status, \
              event_count, first_seen, last_seen \
-             FROM issues ORDER BY last_seen DESC",
+             FROM issues ORDER BY last_seen DESC LIMIT ?",
         )
+        .bind(ISSUE_LIST_LIMIT)
         .fetch_all(&self.pool)
         .await?;
         Ok(rows.into_iter().map(Into::into).collect())
@@ -550,9 +564,10 @@ impl Store {
         let rows: Vec<IssueRow> = sqlx::query_as(
             "SELECT id, project, fingerprint, title, culprit, level, status, \
              event_count, first_seen, last_seen \
-             FROM issues WHERE project = ? ORDER BY last_seen DESC",
+             FROM issues WHERE project = ? ORDER BY last_seen DESC LIMIT ?",
         )
         .bind(project)
+        .bind(ISSUE_LIST_LIMIT)
         .fetch_all(&self.pool)
         .await?;
         Ok(rows.into_iter().map(Into::into).collect())
@@ -1015,10 +1030,10 @@ impl Store {
         // bucket in Rust — simpler and more portable than juggling SQLite's
         // `strftime` modulo arithmetic, and the row count is bounded by a
         // single project's 24h traffic (small for self-host).
-        let rows: Vec<(String,)> = sqlx::query_as(
-            "SELECT e.received_at FROM events e \
-             JOIN issues i ON e.issue_id = i.id \
-             WHERE i.project = ? AND e.received_at >= ?",
+        let hourly: Vec<(String, i64)> = sqlx::query_as(
+            "SELECT strftime('%Y-%m-%dT%H', e.received_at) AS hour, COUNT(*) \
+             FROM events e JOIN issues i ON e.issue_id = i.id \
+             WHERE i.project = ? AND e.received_at >= ? GROUP BY hour",
         )
         .bind(project)
         .bind(&cutoff_str)
@@ -1026,18 +1041,20 @@ impl Store {
         .await?;
 
         let mut hourly_buckets = vec![0i64; 24];
-        for (ts,) in rows {
-            let dt = match DateTime::parse_from_rfc3339(&ts) {
-                Ok(dt) => dt.with_timezone(&Utc),
-                Err(_) => continue,
+        for (hour, count) in hourly {
+            let Ok(naive) = chrono::NaiveDateTime::parse_from_str(
+                &format!("{hour}:00:00"),
+                "%Y-%m-%dT%H:%M:%S",
+            ) else {
+                continue;
             };
             // Bucket index: oldest = 0, newest = 23. `now` lands in 23.
-            let hours_ago = (now - dt).num_hours();
+            let hours_ago = (now - naive.and_utc()).num_hours();
             if !(0..24).contains(&hours_ago) {
                 continue;
             }
             let idx = (23 - hours_ago) as usize;
-            hourly_buckets[idx] += 1;
+            hourly_buckets[idx] += count;
         }
 
         Ok(ActivityStats {
@@ -1062,6 +1079,40 @@ impl Store {
     /// Insert a new user. Caller is responsible for hashing the password
     /// (this layer is crypto-agnostic so callers can pre-validate
     /// strength). Errors with NOT NULL violation if username exists.
+    /// Creates the first user only if the table is still empty. The check and
+    /// insert are one statement, so two concurrent setup requests cannot both
+    /// succeed. Returns `None` when a user already exists.
+    pub async fn create_first_user(
+        &self,
+        username: &str,
+        password_hash: &str,
+        role: Role,
+    ) -> Result<Option<User>, DaemonError> {
+        let now = Utc::now().to_rfc3339();
+        let inserted = sqlx::query(
+            "INSERT INTO users (username, password_hash, role, created_at) \
+             SELECT ?, ?, ?, ? WHERE NOT EXISTS (SELECT 1 FROM users)",
+        )
+        .bind(username)
+        .bind(password_hash)
+        .bind(role.as_str())
+        .bind(&now)
+        .execute(&self.pool)
+        .await?
+        .rows_affected();
+        if inserted == 0 {
+            return Ok(None);
+        }
+        Ok(Some(User {
+            username: username.to_string(),
+            role,
+            created_at: parse_or_now(&now),
+            last_login_at: None,
+            last_login_ip: None,
+            deactivated_at: None,
+        }))
+    }
+
     pub async fn create_user(
         &self,
         username: &str,
@@ -1124,20 +1175,28 @@ impl Store {
         Ok(row.map(|(h,)| h))
     }
 
+    /// Sets the password and revokes the user's existing sessions, so a
+    /// stolen cookie stops working once the credential changes.
     pub async fn set_user_password(
         &self,
         username: &str,
         password_hash: &str,
     ) -> Result<(), DaemonError> {
+        let mut tx = self.pool.begin().await?;
         let updated = sqlx::query("UPDATE users SET password_hash = ? WHERE username = ?")
             .bind(password_hash)
             .bind(username)
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await?
             .rows_affected();
         if updated == 0 {
             return Err(DaemonError::NotFound(format!("user {username}")));
         }
+        sqlx::query("DELETE FROM sessions WHERE username = ?")
+            .bind(username)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
         Ok(())
     }
 

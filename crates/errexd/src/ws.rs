@@ -96,6 +96,17 @@ fn origin_allowed(origin: &str, public_url: &str, dev_mode: bool) -> bool {
 }
 
 const SESSION_RECHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+const SEND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+async fn send_text(
+    write: &mut futures_util::stream::SplitSink<WebSocket, Message>,
+    payload: String,
+) -> bool {
+    matches!(
+        tokio::time::timeout(SEND_TIMEOUT, write.send(Message::Text(payload))).await,
+        Ok(Ok(()))
+    )
+}
 
 async fn run(
     socket: WebSocket,
@@ -119,7 +130,7 @@ async fn run(
     let snapshot = ServerMessage::Snapshot { issues };
     for msg in [hello, snapshot] {
         let payload = serde_json::to_string(&msg).expect("ServerMessage is always serializable");
-        if write.send(Message::Text(payload)).await.is_err() {
+        if !send_text(&mut write, payload).await {
             return Ok(());
         }
     }
@@ -131,7 +142,7 @@ async fn run(
                 Ok(m) => {
                     let payload = serde_json::to_string(&m)
                         .expect("ServerMessage is always serializable");
-                    if write.send(Message::Text(payload)).await.is_err() {
+                    if !send_text(&mut write, payload).await {
                         break;
                     }
                 }

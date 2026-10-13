@@ -49,6 +49,9 @@ pub struct IngestEvent {
     pub event_id: String,
     /// Pre-serialized event JSON for the `events.payload` column.
     pub payload: String,
+    /// This event's share of the ingest memory budget. Released when the
+    /// digest task drops the record after persisting it.
+    pub _budget: Option<std::sync::Arc<tokio::sync::OwnedSemaphorePermit>>,
 }
 
 /// Build a digest-ready record from a raw `Event` parsed off the wire.
@@ -103,6 +106,7 @@ pub fn prepare(project: String, event: Event) -> IngestEvent {
         received_at: Utc::now(),
         event_id,
         payload,
+        _budget: None,
     }
 }
 

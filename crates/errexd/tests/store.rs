@@ -2220,3 +2220,36 @@ async fn replayed_event_does_not_bump_count_or_reopen_issue() {
         received.0
     );
 }
+
+#[tokio::test]
+async fn create_first_user_succeeds_only_once() {
+    let (store, _dir) = fresh_store().await;
+    let first = store
+        .create_first_user("alice", "hash", Role::Admin)
+        .await
+        .unwrap();
+    assert!(first.is_some());
+    let second = store
+        .create_first_user("mallory", "hash", Role::Admin)
+        .await
+        .unwrap();
+    assert!(second.is_none());
+    assert!(store.get_user("mallory").await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn password_change_revokes_existing_sessions() {
+    let (store, _dir) = fresh_store().await;
+    store
+        .create_user("bob", "old-hash", Role::Admin)
+        .await
+        .unwrap();
+    store
+        .create_session("sess-1", "bob", None, None)
+        .await
+        .unwrap();
+    assert!(store.session_for_id("sess-1").await.unwrap().is_some());
+
+    store.set_user_password("bob", "new-hash").await.unwrap();
+    assert!(store.session_for_id("sess-1").await.unwrap().is_none());
+}
