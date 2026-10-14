@@ -1,0 +1,66 @@
+# errexd on wp-vps. Install to /etc/systemd/system/errexd.service.
+#
+# Bound to [::1]:9090 (nginx in front) and [::1]:9092 (MCP stub); nothing
+# listens on a public address. State in /var/lib/errex, owned by the
+# `errex` system user. The Telegram token is handed over as a systemd
+# credential, so it is readable by this service only and never sits in the
+# environment.
+[Unit]
+Description=errex error tracker (Zeus Flasher Suite reports)
+Documentation=https://github.com/AsmodeusX/errex/tree/feat/zeus-ready/deploy/wp-vps
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=errex
+Group=errex
+ExecStart=/usr/local/bin/errexd
+EnvironmentFile=/etc/errex/errexd.env
+LoadCredential=telegram_bot_token:/etc/errex/telegram_bot_token
+Environment=ERREX_TELEGRAM_BOT_TOKEN_FILE=%d/telegram_bot_token
+# journald does not render ANSI colours.
+Environment=NO_COLOR=1
+StateDirectory=errex
+StateDirectoryMode=0750
+WorkingDirectory=/var/lib/errex
+Restart=on-failure
+RestartSec=5
+
+# Resources: the host has 1 vCPU, ~1 GB RAM and no swap.
+MemoryMax=128M
+MemorySwapMax=0
+CPUQuota=50%
+TasksMax=64
+LimitCORE=0
+LimitNOFILE=4096
+
+# Sandbox
+ProtectSystem=strict
+ReadWritePaths=/var/lib/errex
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+NoNewPrivileges=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged
+CapabilityBoundingSet=
+AmbientCapabilities=
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

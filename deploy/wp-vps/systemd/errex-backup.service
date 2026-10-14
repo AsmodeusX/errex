@@ -1,0 +1,33 @@
+# Nightly SQLite backup of errex. Install to /etc/systemd/system/.
+# Started by errex-backup.timer; runs /usr/local/lib/errex/errex-backup.sh.
+[Unit]
+Description=errex nightly SQLite backup
+After=errexd.service
+
+[Service]
+Type=oneshot
+User=errex
+Group=errex
+ExecStart=/usr/local/lib/errex/errex-backup.sh
+Environment=ERREX_DB=/var/lib/errex/errex.db
+Environment=ERREX_BACKUP_DIR=/var/backups/errex
+Environment=ERREX_BACKUP_KEEP_DAYS=14
+Nice=10
+IOSchedulingClass=idle
+MemoryMax=64M
+CPUQuota=50%
+LimitCORE=0
+ProtectSystem=strict
+# A reader of a WAL database writes its -shm file, hence /var/lib/errex.
+ReadWritePaths=/var/lib/errex /var/backups/errex
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+PrivateNetwork=yes
+NoNewPrivileges=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_UNIX
+CapabilityBoundingSet=
+UMask=0077
