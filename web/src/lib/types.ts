@@ -53,9 +53,9 @@ export type SortKey = 'recent' | 'stale' | 'count';
 // ----- Event detail -----
 //
 // Mirrors errex_proto::Event for the fields the UI renders. The daemon
-// preserves the entire payload verbatim so we can surface fields the proto
-// doesn't model yet (breadcrumbs, tags, contexts) by reading them as
-// optional unknowns from the JSON.
+// keeps every field the SDK sent (after server-side scrubbing), so fields
+// no section models (debug_meta, sdk, mechanism, instruction_addr, ...) are
+// reachable through the index signatures and shown as additional data.
 
 export interface Frame {
   filename?: string | null;
@@ -66,6 +66,9 @@ export interface Frame {
   in_app?: boolean | null;
   /** Some SDKs emit `vars` per frame; surfaced verbatim. */
   vars?: Record<string, unknown>;
+  /** Native and AOT frames: the address offline symbolication reads. */
+  instruction_addr?: string | null;
+  [key: string]: unknown;
 }
 
 export interface ExceptionInfo {
@@ -73,6 +76,9 @@ export interface ExceptionInfo {
   value?: string | null;
   module?: string | null;
   stacktrace?: { frames?: Frame[] } | null;
+  /** How the error was captured (`handled`, `type`, ...). */
+  mechanism?: Record<string, unknown> | null;
+  [key: string]: unknown;
 }
 
 export interface Breadcrumb {
@@ -102,6 +108,9 @@ export interface EventPayload {
   exception?: { values?: ExceptionInfo[] } | null;
   breadcrumbs?: { values?: Breadcrumb[] } | Breadcrumb[] | null;
   tags?: Record<string, string> | Array<[string, string]> | null;
+  extra?: Record<string, unknown> | null;
+  contexts?: Record<string, unknown> | null;
+  [key: string]: unknown;
 }
 
 /** What `/api/issues/:id/event` returns. */

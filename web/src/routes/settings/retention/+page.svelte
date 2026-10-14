@@ -11,7 +11,7 @@
   import { toast } from '$lib/toast.svelte';
 
   // Picked to match the preset balance the preview converged on. Used when
-  // a user toggles a limit OFF (back from "unlimited") so the input lands
+  // a user toggles a limit OFF (back from the deploy default) so the input lands
   // on a sensible value instead of an empty 0.
   const DEFAULTS = {
     events_per_issue_max: 100,
@@ -34,22 +34,22 @@
     {
       key: 'events_per_issue_max',
       label: 'Events per issue',
-      overrideLabel: 'unlimited',
-      overrideHelp: 'No bound on events per issue.',
+      overrideLabel: 'use deploy default',
+      overrideHelp: 'Falls back to ERREX_EVENTS_PER_ISSUE_MAX (0 there = unlimited).',
       help: 'Keep at most this many recent payloads per issue. The issue row (counts, first/last seen) is preserved when payloads roll off.'
     },
     {
       key: 'issues_per_project_max',
       label: 'Issues per project',
-      overrideLabel: 'unlimited',
-      overrideHelp: 'No bound on issues per project.',
+      overrideLabel: 'use deploy default',
+      overrideHelp: 'Falls back to ERREX_ISSUES_PER_PROJECT_MAX (0 there = unlimited).',
       help: "Drop the oldest issues per project beyond this count. Cascades to the issue's events."
     },
     {
       key: 'event_retention_days',
       label: 'Event payload age',
       overrideLabel: 'use boot config',
-      overrideHelp: 'Falls back to the ERREXD_RETENTION_DAYS env var.',
+      overrideHelp: 'Falls back to ERREX_RETENTION_DAYS (0 there = unlimited).',
       help: 'Delete event payloads older than this many days.',
       suffix: 'days'
     }

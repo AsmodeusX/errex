@@ -260,9 +260,10 @@ export const api = {
   }
 };
 
-/** Operator-configurable retention limits. `0` means "unlimited" for any
- *  field; the daemon's retention task reads these every hour and trims
- *  excess events / issues / aged payloads accordingly. */
+/** Operator-configurable retention limits. `0` means "use the deploy
+ *  default" (`ERREX_EVENTS_PER_ISSUE_MAX`, `ERREX_ISSUES_PER_PROJECT_MAX`,
+ *  `ERREX_RETENTION_DAYS`); the daemon's retention task reads these every
+ *  hour and trims excess events / issues / aged payloads accordingly. */
 export interface RetentionSettings {
   events_per_issue_max: number;
   issues_per_project_max: number;

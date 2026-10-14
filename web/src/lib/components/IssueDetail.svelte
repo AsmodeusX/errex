@@ -24,6 +24,7 @@
   import type { Issue } from '$lib/types';
   import { cn, relativeTime, shortFingerprint } from '$lib/utils';
   import Breadcrumbs from './Breadcrumbs.svelte';
+  import EventData from './EventData.svelte';
   import StackTrace from './StackTrace.svelte';
   import Tags from './Tags.svelte';
 
@@ -299,6 +300,8 @@
       />
       <Separator />
       <Tags tags={event?.tags ?? {}} />
+      <Separator />
+      <EventData payload={event?.raw.payload ?? null} />
     </div>
   </div>
 {/if}

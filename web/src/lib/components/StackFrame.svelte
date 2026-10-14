@@ -1,6 +1,7 @@
 <script lang="ts">
   import { untrack } from 'svelte';
   import { Collapsible } from '$lib/components/ui/collapsible';
+  import { frameDetails } from '$lib/eventDetail';
   import type { Frame } from '$lib/types';
   import { cn } from '$lib/utils';
 
@@ -9,6 +10,7 @@
 
   const inApp = $derived(frame.in_app === true);
   const hasVars = $derived(frame.vars && Object.keys(frame.vars).length > 0);
+  const details = $derived(frameDetails(frame));
   // Throw-site anchor pre-expands so the eye lands on the row that
   // raised the exception without an extra click; mirrors Breadcrumbs.
   // Frames are keyed by index, so anchor is stable per mount — read it
@@ -18,7 +20,7 @@
 
 <Collapsible
   bind:open
-  showChevron={hasVars}
+  showChevron={hasVars || details.length > 0}
   triggerClass={cn(
     'px-2 py-1 font-mono text-[12px] gap-2',
     anchor && 'border-l-2 border-l-amber-500 bg-amber-500/5 pl-1.5'
@@ -47,6 +49,18 @@
     </span>
   {/snippet}
 
+  {#if details.length > 0}
+    <table class="w-full border-collapse">
+      <tbody>
+        {#each details as [k, v] (k)}
+          <tr class="border-b border-border/30 last:border-0">
+            <td class="text-muted-foreground py-0.5 pr-3 align-top whitespace-nowrap">{k}</td>
+            <td class="py-0.5 align-top break-all">{v}</td>
+          </tr>
+        {/each}
+      </tbody>
+    </table>
+  {/if}
   {#if frame.vars}
     <table class="w-full border-collapse">
       <tbody>

@@ -6,6 +6,7 @@
 import type {
   Breadcrumb,
   EventPayload,
+  ExceptionInfo,
   Frame,
   IssueLevel,
   NormalizedEvent,
@@ -164,4 +165,80 @@ export function throwSiteIndex(frames: Frame[]): number {
     if (frames[i]?.in_app === true) return i;
   }
   return frames.length - 1;
+}
+
+// Top-level payload keys a dedicated section (header, stack trace,
+// breadcrumbs, tags) already renders, or that never carry content.
+const RENDERED_KEYS = new Set([
+  'event_id',
+  'timestamp',
+  'platform',
+  'level',
+  'environment',
+  'release',
+  'server_name',
+  'message',
+  'logentry',
+  'fingerprint',
+  'exception',
+  'breadcrumbs',
+  'tags',
+  'extra',
+  'contexts'
+]);
+
+// Frame keys the frame row itself shows; `vars` has its own table.
+const FRAME_ROW_KEYS = new Set([
+  'filename',
+  'function',
+  'module',
+  'lineno',
+  'colno',
+  'in_app',
+  'vars'
+]);
+
+function isEmpty(v: unknown): boolean {
+  if (v === null || v === undefined || v === '') return true;
+  if (Array.isArray(v)) return v.length === 0;
+  if (typeof v === 'object') return Object.keys(v as object).length === 0;
+  return false;
+}
+
+/**
+ * Payload fields no dedicated section renders: `extra`, `contexts`, the
+ * primary exception's `mechanism`, then every field the SDK sent that
+ * errex does not model (`debug_meta`, `sdk`, `dist`, `threads`, ...),
+ * alphabetically. Empty values are skipped.
+ */
+export function additionalData(p: EventPayload): Array<{ key: string; value: unknown }> {
+  const out: Array<{ key: string; value: unknown }> = [];
+  const push = (key: string, value: unknown) => {
+    if (!isEmpty(value)) out.push({ key, value });
+  };
+  push('extra', p.extra);
+  push('contexts', p.contexts);
+  const ex: ExceptionInfo | undefined = p.exception?.values?.[0];
+  push('exception.mechanism', ex?.mechanism);
+  const unknown = Object.keys(p)
+    .filter((k) => !RENDERED_KEYS.has(k))
+    .sort();
+  for (const k of unknown) push(k, p[k]);
+  return out;
+}
+
+/** A frame's fields the frame row does not show, sorted by key. */
+export function frameDetails(f: Frame): Array<[string, string]> {
+  return Object.keys(f)
+    .filter((k) => !FRAME_ROW_KEYS.has(k) && !isEmpty(f[k]))
+    .sort()
+    .map((k) => {
+      const v = f[k];
+      return [k, typeof v === 'string' ? v : JSON.stringify(v)];
+    });
+}
+
+/** Strings verbatim (a trace keeps its line breaks), structures pretty-printed. */
+export function formatData(v: unknown): string {
+  return typeof v === 'string' ? v : JSON.stringify(v, null, 2);
 }

@@ -1,11 +1,14 @@
 import { describe, expect, it } from 'vitest';
 import {
+  additionalData,
   breadcrumbRelativeTime,
   dedupTags,
+  formatData,
+  frameDetails,
   partitionFrames,
   throwSiteIndex
 } from './eventDetail';
-import type { Frame } from './types';
+import type { EventPayload, Frame } from './types';
 
 describe('dedupTags', () => {
   it('drops `x.name` when `x` is also present', () => {
@@ -130,5 +133,76 @@ describe('throwSiteIndex', () => {
 
   it('treats null/undefined in_app as library frames for ranking', () => {
     expect(throwSiteIndex([frame(null), frame(undefined), frame(true)])).toBe(2);
+  });
+});
+
+describe('additionalData', () => {
+  it('lists fields the dedicated sections do not render', () => {
+    const p: EventPayload = {
+      message: 'm',
+      release: 'r',
+      tags: { a: 'b' },
+      extra: { dart_stack: '#00 abs 0000007a' },
+      contexts: { os: { name: 'Android' } },
+      sdk: { name: 'zeus.reporter' },
+      debug_meta: { images: [] },
+      dist: '45',
+      exception: {
+        values: [{ type: 'E', mechanism: { type: 'FlutterError', handled: false } }]
+      }
+    };
+    const keys = additionalData(p).map((e) => e.key);
+    expect(keys).toEqual([
+      'extra',
+      'contexts',
+      'exception.mechanism',
+      'debug_meta',
+      'dist',
+      'sdk'
+    ]);
+  });
+
+  it('skips empty and null values', () => {
+    const p = { extra: {}, contexts: null, sdk: undefined, threads: [] } as EventPayload;
+    expect(additionalData(p)).toEqual([]);
+  });
+
+  it('returns nothing for a payload with only modelled fields', () => {
+    expect(additionalData({ message: 'm', level: 'error' })).toEqual([]);
+  });
+});
+
+describe('frameDetails', () => {
+  it('returns the fields a frame row does not show', () => {
+    const f: Frame = {
+      function: 'f',
+      filename: 'a.dart',
+      lineno: 3,
+      in_app: true,
+      instruction_addr: '0x2f5c1f',
+      addr_mode: 'rel:0',
+      vars: { x: 1 }
+    };
+    expect(frameDetails(f)).toEqual([
+      ['addr_mode', 'rel:0'],
+      ['instruction_addr', '0x2f5c1f']
+    ]);
+  });
+
+  it('stringifies non-string values', () => {
+    expect(frameDetails({ function: 'f', symbol_addr: 16, flags: { a: 1 } })).toEqual([
+      ['flags', '{"a":1}'],
+      ['symbol_addr', '16']
+    ]);
+  });
+});
+
+describe('formatData', () => {
+  it('keeps strings verbatim so traces keep their line breaks', () => {
+    expect(formatData('#00 abs\n#01 abs')).toBe('#00 abs\n#01 abs');
+  });
+
+  it('pretty-prints structures', () => {
+    expect(formatData({ a: 1 })).toBe('{\n  "a": 1\n}');
   });
 });
