@@ -43,6 +43,12 @@ impl TokenBucket {
             false
         }
     }
+
+    /// Whole seconds until the next token, at least 1. Call after a refused
+    /// `try_acquire`, which has just refilled the bucket.
+    pub fn retry_after_secs(&self, refill_per_sec: f64) -> u64 {
+        ((1.0 - self.tokens) / refill_per_sec).ceil().max(1.0) as u64
+    }
 }
 
 #[derive(Debug)]
@@ -68,15 +74,21 @@ impl RateLimiter {
         self.refill_per_sec > 0.0
     }
 
-    pub fn check(&self, project: &str, now: Instant) -> bool {
+    /// `Err(seconds)` when the project is over its rate: how long until it
+    /// may send again, for `Retry-After` and `X-Sentry-Rate-Limits`.
+    pub fn check(&self, project: &str, now: Instant) -> Result<(), u64> {
         if !self.enabled() {
-            return true;
+            return Ok(());
         }
         let mut guard = self.buckets.lock().expect("rate limiter mutex poisoned");
         let bucket = guard
             .entry(project.to_string())
             .or_insert_with(|| TokenBucket::new(self.capacity, now));
-        bucket.try_acquire(self.capacity, self.refill_per_sec, now)
+        if bucket.try_acquire(self.capacity, self.refill_per_sec, now) {
+            Ok(())
+        } else {
+            Err(bucket.retry_after_secs(self.refill_per_sec))
+        }
     }
 }
 
@@ -137,7 +149,10 @@ mod tests {
         let l = RateLimiter::new(0, 100);
         assert!(!l.enabled());
         for _ in 0..10_000 {
-            assert!(l.check("p", t0()), "disabled limiter must always pass");
+            assert!(
+                l.check("p", t0()).is_ok(),
+                "disabled limiter must always pass"
+            );
         }
     }
 
@@ -146,10 +161,10 @@ mod tests {
         let l = RateLimiter::new(60, 5); // 1 tok/sec, burst 5
         let now = t0();
         for _ in 0..5 {
-            assert!(l.check("p", now));
+            assert!(l.check("p", now).is_ok());
         }
         assert!(
-            !l.check("p", now),
+            l.check("p", now).is_err(),
             "6th request inside same instant must deny"
         );
     }
@@ -158,20 +173,35 @@ mod tests {
     fn limiter_isolates_projects() {
         let l = RateLimiter::new(60, 1); // 1 token capacity, then deny
         let now = t0();
-        assert!(l.check("alpha", now));
-        assert!(!l.check("alpha", now));
+        assert!(l.check("alpha", now).is_ok());
+        assert!(l.check("alpha", now).is_err());
         // Beta is independent.
-        assert!(l.check("beta", now));
-        assert!(!l.check("beta", now));
+        assert!(l.check("beta", now).is_ok());
+        assert!(l.check("beta", now).is_err());
+    }
+
+    #[test]
+    fn denial_says_how_long_until_the_next_token() {
+        let start = t0();
+        let fast = RateLimiter::new(60, 1); // 1/sec
+        assert_eq!(fast.check("p", start), Ok(()));
+        assert_eq!(fast.check("p", start), Err(1));
+        let slow = RateLimiter::new(6, 1); // one per 10 s
+        assert_eq!(slow.check("p", start), Ok(()));
+        assert_eq!(slow.check("p", start), Err(10));
+        assert_eq!(slow.check("p", start + Duration::from_secs(4)), Err(6));
     }
 
     #[test]
     fn limiter_recovers_with_time() {
         let l = RateLimiter::new(60, 1); // 1/sec
         let start = t0();
-        assert!(l.check("p", start));
-        assert!(!l.check("p", start));
+        assert!(l.check("p", start).is_ok());
+        assert!(l.check("p", start).is_err());
         let later = start + Duration::from_secs(2);
-        assert!(l.check("p", later), "after 2s must have a fresh token");
+        assert!(
+            l.check("p", later).is_ok(),
+            "after 2s must have a fresh token"
+        );
     }
 }

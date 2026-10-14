@@ -33,9 +33,9 @@ use tokio::sync::mpsc;
 
 use crate::store::Store;
 
-type WebhookClient = Client<HttpsConnector<HttpConnector<CheckedResolver>>, Full<Bytes>>;
+pub(crate) type WebhookClient = Client<HttpsConnector<HttpConnector<CheckedResolver>>, Full<Bytes>>;
 
-fn build_client() -> WebhookClient {
+pub(crate) fn build_client() -> WebhookClient {
     let mut http = HttpConnector::new_with_resolver(CheckedResolver);
     // Bound the TCP handshake — webhooks are not a load-bearing path,
     // so a slow connect must not stall the task. Mirrors the prior
@@ -63,6 +63,16 @@ const SEND_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_RESPONSE_BYTES: usize = 64 * 1024;
 
 async fn post_json(client: &WebhookClient, url: &str, body: &Value) -> Result<u16, String> {
+    send_json(client, url, body).await.map(|(status, _)| status)
+}
+
+/// POST `body` as JSON and return the status with up to
+/// [`MAX_RESPONSE_BYTES`] of the response body.
+pub(crate) async fn send_json(
+    client: &WebhookClient,
+    url: &str,
+    body: &Value,
+) -> Result<(u16, Bytes), String> {
     let body_bytes = serde_json::to_vec(body).map_err(|e| format!("serialize body: {e}"))?;
     let req = Request::builder()
         .method(Method::POST)
@@ -70,7 +80,7 @@ async fn post_json(client: &WebhookClient, url: &str, body: &Value) -> Result<u1
         .header("content-type", "application/json")
         .header("user-agent", concat!("errexd/", env!("CARGO_PKG_VERSION")))
         .body(Full::new(Bytes::from(body_bytes)))
-        .map_err(|e| format!("build request: {e}"))?;
+        .map_err(|_| "build request".to_string())?;
 
     let exchange = async {
         let resp = client
@@ -78,11 +88,13 @@ async fn post_json(client: &WebhookClient, url: &str, body: &Value) -> Result<u1
             .await
             .map_err(|e| format!("send: {e}"))?;
         let status = resp.status().as_u16();
-        // Drain for connection reuse. Best-effort — body content is never surfaced.
-        let _ = Limited::new(resp.into_body(), MAX_RESPONSE_BYTES)
+        // Draining also returns the connection to the pool.
+        let body = Limited::new(resp.into_body(), MAX_RESPONSE_BYTES)
             .collect()
-            .await;
-        Ok(status)
+            .await
+            .map(|c| c.to_bytes())
+            .unwrap_or_default();
+        Ok((status, body))
     };
     tokio::time::timeout(SEND_TIMEOUT, exchange)
         .await
@@ -96,7 +108,7 @@ const ALLOW_PRIVATE_DESTINATIONS: bool = cfg!(test);
 /// The connector dials only the addresses returned here, so a DNS answer
 /// cannot change between the check and the connection.
 #[derive(Clone)]
-struct CheckedResolver;
+pub(crate) struct CheckedResolver;
 
 impl tower_service::Service<Name> for CheckedResolver {
     type Response = std::vec::IntoIter<SocketAddr>;
@@ -213,11 +225,13 @@ fn ip_is_private_or_local(ip: IpAddr) -> bool {
     }
 }
 
-/// What the digest task fires when a webhook-worthy event happens.
+/// What the digest task fires when an alert-worthy event happens.
 #[derive(Debug, Clone)]
 pub struct Trigger {
     pub issue: Issue,
     pub kind: TriggerKind,
+    /// Release of the event that fired the trigger. Issues do not carry one.
+    pub release: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -226,6 +240,9 @@ pub enum TriggerKind {
     NewIssue,
     /// Resolved issue saw a fresh event — also notify.
     Regression,
+    /// An event matched the paging rule (`digest::pages`). Fires on every
+    /// such event, whatever the issue's state: each one is a different car.
+    Page,
 }
 
 impl TriggerKind {
@@ -233,14 +250,39 @@ impl TriggerKind {
         match self {
             TriggerKind::NewIssue => "New issue",
             TriggerKind::Regression => "Regression",
+            TriggerKind::Page => "PAGE: fatal with erased flash",
         }
     }
     pub fn slack_color(self) -> &'static str {
         // Slack/Discord both interpret these named colors.
         match self {
-            TriggerKind::NewIssue => "danger",
+            TriggerKind::NewIssue | TriggerKind::Page => "danger",
             TriggerKind::Regression => "warning",
         }
+    }
+}
+
+/// Muted and ignored issues stay quiet, except for a page.
+pub(crate) fn should_alert(t: &Trigger) -> bool {
+    t.kind == TriggerKind::Page
+        || !matches!(t.issue.status, IssueStatus::Muted | IssueStatus::Ignored)
+}
+
+/// The digest task's alert outputs. Each sink has its own bounded channel
+/// and task, so a slow webhook endpoint never delays a Telegram page. A full
+/// channel drops the alert (surfaced through `/metrics` for the webhook).
+#[derive(Debug, Clone)]
+pub struct AlertSinks {
+    pub webhook: mpsc::Sender<Trigger>,
+    pub telegram: Option<mpsc::Sender<Trigger>>,
+}
+
+impl AlertSinks {
+    pub fn fire(&self, t: Trigger) {
+        if let Some(tg) = &self.telegram {
+            let _ = tg.try_send(t.clone());
+        }
+        let _ = self.webhook.try_send(t);
     }
 }
 
@@ -256,6 +298,9 @@ pub fn build_payload(t: &Trigger, public_url: &str) -> Value {
     ];
     if let Some(level) = &issue.level {
         fields.push(json!({"title": "Level", "value": level, "short": true}));
+    }
+    if let Some(release) = &t.release {
+        fields.push(json!({"title": "Release", "value": release, "short": true}));
     }
     if let Some(culprit) = &issue.culprit {
         fields.push(json!({"title": "Culprit", "value": culprit, "short": false}));
@@ -288,10 +333,7 @@ pub async fn run(store: Store, public_url: String, mut rx: mpsc::Receiver<Trigge
         // those statuses. Regression of a previously-resolved issue is
         // explicitly NOT muted because the regression event already flipped
         // it to unresolved before reaching here.
-        if matches!(
-            trigger.issue.status,
-            IssueStatus::Muted | IssueStatus::Ignored
-        ) {
+        if !should_alert(&trigger) {
             continue;
         }
 
@@ -460,6 +502,7 @@ mod tests {
         let t = Trigger {
             issue: issue(),
             kind: TriggerKind::NewIssue,
+            release: None,
         };
         let v = build_payload(&t, "https://errex.example.com");
         let attachments = v.get("attachments").and_then(|a| a.as_array()).unwrap();
@@ -479,6 +522,7 @@ mod tests {
         let t = Trigger {
             issue: issue(),
             kind: TriggerKind::Regression,
+            release: None,
         };
         let v = build_payload(&t, "https://errex.example.com");
         let attachments = v.get("attachments").and_then(|a| a.as_array()).unwrap();
@@ -494,10 +538,61 @@ mod tests {
     }
 
     #[test]
+    fn payload_carries_the_release_when_known() {
+        let t = Trigger {
+            issue: issue(),
+            kind: TriggerKind::Page,
+            release: Some("com.zeusmotorsport.suite@1.2.3+45".into()),
+        };
+        let v = build_payload(&t, "https://errex.example.com");
+        let fields = v
+            .pointer("/attachments/0/fields")
+            .unwrap()
+            .as_array()
+            .unwrap();
+        assert!(fields
+            .iter()
+            .any(|f| f["title"] == "Release" && f["value"] == "com.zeusmotorsport.suite@1.2.3+45"));
+        assert!(v["text"].as_str().unwrap().starts_with("PAGE"));
+    }
+
+    #[test]
+    fn muted_issues_stay_quiet_except_for_a_page() {
+        let mut muted = issue();
+        muted.status = IssueStatus::Muted;
+        let t = |kind| Trigger {
+            issue: muted.clone(),
+            kind,
+            release: None,
+        };
+        assert!(!should_alert(&t(TriggerKind::NewIssue)));
+        assert!(!should_alert(&t(TriggerKind::Regression)));
+        assert!(should_alert(&t(TriggerKind::Page)));
+    }
+
+    #[tokio::test]
+    async fn alert_sinks_fan_out_to_every_channel() {
+        let (wh_tx, mut wh_rx) = mpsc::channel(1);
+        let (tg_tx, mut tg_rx) = mpsc::channel(1);
+        let sinks = AlertSinks {
+            webhook: wh_tx,
+            telegram: Some(tg_tx),
+        };
+        sinks.fire(Trigger {
+            issue: issue(),
+            kind: TriggerKind::Page,
+            release: None,
+        });
+        assert_eq!(wh_rx.recv().await.unwrap().kind, TriggerKind::Page);
+        assert_eq!(tg_rx.recv().await.unwrap().kind, TriggerKind::Page);
+    }
+
+    #[test]
     fn payload_includes_issue_link() {
         let t = Trigger {
             issue: issue(),
             kind: TriggerKind::NewIssue,
+            release: None,
         };
         let v = build_payload(&t, "https://errex.example.com/");
         let link = v
@@ -512,6 +607,7 @@ mod tests {
         let t = Trigger {
             issue: issue(),
             kind: TriggerKind::NewIssue,
+            release: None,
         };
         let v = build_payload(&t, "https://errex.example.com");
         let fields = v
@@ -612,6 +708,7 @@ mod tests {
         tx.send(Trigger {
             issue: issue_for("p"),
             kind: TriggerKind::NewIssue,
+            release: None,
         })
         .await
         .unwrap();
@@ -637,6 +734,7 @@ mod tests {
         tx.send(Trigger {
             issue: issue_for("p"),
             kind: TriggerKind::NewIssue,
+            release: None,
         })
         .await
         .unwrap();
@@ -671,6 +769,7 @@ mod tests {
         tx.send(Trigger {
             issue: issue_for("p"),
             kind: TriggerKind::NewIssue,
+            release: None,
         })
         .await
         .unwrap();
@@ -713,6 +812,7 @@ mod tests {
         tx.send(Trigger {
             issue: issue_for("p"),
             kind: TriggerKind::NewIssue,
+            release: None,
         })
         .await
         .unwrap();

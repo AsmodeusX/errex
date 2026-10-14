@@ -25,6 +25,8 @@ use tower::util::ServiceExt;
 
 #[path = "../src/auth.rs"]
 mod auth;
+#[path = "../src/client_ip.rs"]
+mod client_ip;
 #[path = "../src/crypto.rs"]
 mod crypto;
 #[path = "../src/digest.rs"]
@@ -41,6 +43,8 @@ mod lockout;
 mod metrics;
 #[path = "../src/rate_limit.rs"]
 mod rate_limit;
+#[path = "../src/scrub.rs"]
+mod scrub;
 #[path = "../src/spa.rs"]
 mod spa;
 #[path = "../src/store.rs"]
@@ -120,7 +124,7 @@ async fn fixture_full(
         dev_mode: true,
         // Trust XFF in tests so the existing lockout-by-IP fixtures keep
         // exercising the same code path; production defaults the other way.
-        trust_proxy_headers: true,
+        client_ip: client_ip::ClientIpPolicy::ForwardedFor,
         metrics: Arc::new(metrics::Metrics::new()),
         webhook_capacity: 8,
         webhook_sender: webhook_tx,
@@ -835,6 +839,43 @@ async fn ingest_returns_429_when_rate_limit_exceeded() {
 }
 
 #[tokio::test]
+async fn ingest_429_tells_the_sdk_when_to_retry() {
+    // 6/min = one token per 10 s. Sentry SDKs read X-Sentry-Rate-Limits
+    // (`<seconds>:<categories>:<scope>`, empty categories = all) and fall
+    // back to Retry-After.
+    let (router, _store, _dir) = fixture_with_rate_limit(6, 1).await;
+    let send = || async {
+        router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/p/envelope/")
+                    .header("origin", "https://app.example")
+                    .body(sample_envelope_body())
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+    };
+    assert_eq!(send().await.status(), StatusCode::OK);
+    let res = send().await;
+    assert_eq!(res.status(), StatusCode::TOO_MANY_REQUESTS);
+    let h = res.headers();
+    assert_eq!(h.get("retry-after").unwrap(), "10");
+    assert_eq!(h.get("x-sentry-rate-limits").unwrap(), "10::project");
+    let exposed = h
+        .get("access-control-expose-headers")
+        .map(|v| v.to_str().unwrap().to_ascii_lowercase())
+        .unwrap_or_default();
+    assert!(
+        exposed.contains("x-sentry-rate-limits"),
+        "browser SDKs must see it"
+    );
+    assert!(exposed.contains("retry-after"));
+}
+
+#[tokio::test]
 async fn ingest_with_rate_limit_zero_is_unlimited() {
     let (router, _store, _dir) = fixture_with_rate_limit(0, 0).await;
     for _ in 0..50 {
@@ -1280,6 +1321,7 @@ async fn seed_one_event(store: &Store, project: &str, fingerprint: &str) -> i64 
         .await
         .unwrap();
     let ev = Event {
+        other: Default::default(),
         event_id: uuid::Uuid::new_v4(),
         timestamp: Utc::now(),
         platform: Some("javascript".into()),

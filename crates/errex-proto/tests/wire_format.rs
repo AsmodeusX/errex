@@ -135,6 +135,73 @@ fn event_round_trip_preserves_passthrough_fields() {
 }
 
 #[test]
+fn event_round_trip_keeps_unknown_fields_at_every_level() {
+    // Symbolication and triage need fields errex does not model: the
+    // event's `debug_meta`, `sdk` and `dist`, an exception's `mechanism`,
+    // a stacktrace's `registers`, a frame's `instruction_addr`. They are
+    // kept verbatim so storage and the API hand back what the SDK sent.
+    let original = json!({
+        "event_id": "11111111111111111111111111111111",
+        "timestamp": "2026-01-02T03:04:05Z",
+        "dist": "45",
+        "sdk": { "name": "zeus.reporter", "version": "1.0.0" },
+        "debug_meta": { "images": [{ "type": "elf", "debug_id": "0f3a5b7c-0000-4000-8000-000000000001" }] },
+        "threads": { "values": [{ "id": 1, "crashed": true }] },
+        "exception": { "values": [{
+            "type": "StateError",
+            "value": "boom",
+            "mechanism": { "type": "FlutterError", "handled": false },
+            "stacktrace": {
+                "registers": { "pc": "0x7f00" },
+                "frames": [{
+                    "function": "f",
+                    "instruction_addr": "0x0000000000002f5c1f",
+                    "addr_mode": "rel:0",
+                    "package": "app.so",
+                    "in_app": true
+                }]
+            }
+        }]},
+        "logentry": { "message": "x %s", "params": ["y"] },
+    });
+    let ev: Event = serde_json::from_value(original.clone()).unwrap();
+    let back: Value = serde_json::to_value(&ev).unwrap();
+    for key in ["dist", "sdk", "debug_meta", "threads"] {
+        assert_eq!(back.get(key), original.get(key), "top-level {key}");
+    }
+    assert_eq!(
+        back.pointer("/exception/values/0/mechanism"),
+        original.pointer("/exception/values/0/mechanism")
+    );
+    assert_eq!(
+        back.pointer("/exception/values/0/stacktrace/registers"),
+        original.pointer("/exception/values/0/stacktrace/registers")
+    );
+    for key in ["instruction_addr", "addr_mode", "package"] {
+        let ptr = format!("/exception/values/0/stacktrace/frames/0/{key}");
+        assert_eq!(back.pointer(&ptr), original.pointer(&ptr), "frame {key}");
+    }
+    assert_eq!(
+        back.pointer("/logentry/params"),
+        original.pointer("/logentry/params")
+    );
+}
+
+#[test]
+fn modelled_fields_do_not_leak_into_the_unknown_map() {
+    let ev: Event = serde_json::from_value(json!({
+        "timestamp": "2026-01-02T03:04:05Z",
+        "release": "r1",
+        "debug_meta": {},
+    }))
+    .unwrap();
+    assert_eq!(ev.release.as_deref(), Some("r1"));
+    assert!(ev.other.contains_key("debug_meta"));
+    assert!(!ev.other.contains_key("release"));
+    assert!(!ev.other.contains_key("timestamp"));
+}
+
+#[test]
 fn level_serializes_as_lowercase_string() {
     // The SPA's IssueLevel union is lowercase; any rename here breaks it.
     let cases = [
@@ -334,5 +401,8 @@ fn client_message_ping_round_trips() {
 fn types_are_reexported_from_crate_root() {
     let _ = Uuid::new_v4();
     let _ = ExceptionContainer { values: vec![] };
-    let _ = Stacktrace { frames: vec![] };
+    let _ = Stacktrace {
+        frames: vec![],
+        other: Default::default(),
+    };
 }

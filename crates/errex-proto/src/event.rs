@@ -1,7 +1,13 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Deserializer, Serialize};
-use serde_json::Value;
+use serde_json::{Map, Value};
 use uuid::Uuid;
+
+/// Fields an SDK sent that errex does not model. Kept verbatim at every
+/// level (event, exception, stacktrace, frame, logentry) so storage and the
+/// API return them: symbolication needs `debug_meta`, `sdk`, `dist`,
+/// `mechanism` and `instruction_addr`, none of which the typed fields carry.
+pub type Unknown = Map<String, Value>;
 
 /// Sentry SDKs send `timestamp` either as an RFC 3339 string or as a Unix
 /// epoch number in seconds (integer or float, sub-second precision). The
@@ -40,20 +46,20 @@ where
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct LogEntry {
     #[serde(default)]
     pub message: Option<String>,
     #[serde(default)]
     pub formatted: Option<String>,
+    #[serde(flatten)]
+    pub other: Unknown,
 }
 
 /// A single error event coming from a Sentry-compatible SDK.
 ///
-/// We model only the fields the scaffold needs. Unknown fields are dropped
-/// rather than retained: `serde(deny_unknown_fields)` would be too strict for
-/// real SDK payloads, and a passthrough JSON blob would defeat the type. If
-/// raw payload preservation is needed, add a `raw: serde_json::Value` field.
+/// The typed fields are the ones errexd reads; everything else lands in
+/// `other` and is serialized back unchanged.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Event {
     #[serde(default = "Uuid::new_v4")]
@@ -113,6 +119,9 @@ pub struct Event {
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub request: Option<Value>,
+
+    #[serde(flatten)]
+    pub other: Unknown,
 }
 
 impl Event {
@@ -151,13 +160,13 @@ pub enum Level {
 }
 
 /// Sentry wraps exceptions in `{ "values": [...] }`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ExceptionContainer {
     #[serde(default)]
     pub values: Vec<ExceptionInfo>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ExceptionInfo {
     #[serde(rename = "type", default)]
     pub ty: Option<String>,
@@ -170,6 +179,9 @@ pub struct ExceptionInfo {
 
     #[serde(default)]
     pub stacktrace: Option<Stacktrace>,
+
+    #[serde(flatten)]
+    pub other: Unknown,
 }
 
 impl ExceptionInfo {
@@ -180,13 +192,16 @@ impl ExceptionInfo {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Stacktrace {
     #[serde(default)]
     pub frames: Vec<Frame>,
+
+    #[serde(flatten)]
+    pub other: Unknown,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Frame {
     #[serde(default)]
     pub filename: Option<String>,
@@ -205,4 +220,7 @@ pub struct Frame {
 
     #[serde(default)]
     pub in_app: Option<bool>,
+
+    #[serde(flatten)]
+    pub other: Unknown,
 }

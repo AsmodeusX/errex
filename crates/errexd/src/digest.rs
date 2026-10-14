@@ -10,12 +10,13 @@
 
 use chrono::{DateTime, Utc};
 use errex_proto::{Event, Fingerprint, Level, ServerMessage};
+use serde_json::Value;
 use tokio::sync::{broadcast, mpsc};
 
 use crate::error::DaemonError;
 use crate::fingerprint;
 use crate::store::{BatchUpsertInput, Store, UpsertResult};
-use crate::webhook;
+use crate::webhook::{self, AlertSinks, TriggerKind};
 
 /// Max events per digest batch. The single-COMMIT-per-batch is what makes
 /// batching worth it under WAL+synchronous=NORMAL: one fsync amortized
@@ -49,6 +50,10 @@ pub struct IngestEvent {
     pub event_id: String,
     /// Pre-serialized event JSON for the `events.payload` column.
     pub payload: String,
+    /// The event's release, for alert text. Capped like the title.
+    pub release: Option<String>,
+    /// The event matched the paging rule ([`pages`]).
+    pub page: bool,
     /// This event's share of the ingest memory budget. Released when the
     /// digest task drops the record after persisting it.
     pub _budget: Option<std::sync::Arc<tokio::sync::OwnedSemaphorePermit>>,
@@ -66,11 +71,50 @@ fn truncate_chars(mut s: String, max: usize) -> String {
     s
 }
 
+/// The paging rule: a fatal event tagged `flash.erased=true` is an ECU left
+/// with erased flash and a silent DME, and pages on every occurrence.
+const PAGE_TAG: (&str, &str) = ("flash.erased", "true");
+
+pub fn pages(event: &Event) -> bool {
+    event.level == Some(Level::Fatal)
+        && match tag_value(event.tags.as_ref(), PAGE_TAG.0) {
+            Some(Value::String(s)) => s == PAGE_TAG.1,
+            Some(Value::Bool(b)) => b.to_string() == PAGE_TAG.1,
+            _ => false,
+        }
+}
+
+/// Tags arrive as an object or as `[key, value]` pairs.
+fn tag_value<'a>(tags: Option<&'a Value>, key: &str) -> Option<&'a Value> {
+    match tags? {
+        Value::Object(map) => map.get(key),
+        Value::Array(pairs) => pairs
+            .iter()
+            .find(|p| p.get(0).and_then(Value::as_str) == Some(key))
+            .and_then(|p| p.get(1)),
+        _ => None,
+    }
+}
+
 /// Cheap (small string allocs + one fingerprint hash + one JSON
 /// serialize); intentionally runs in the HTTP handler instead of the
 /// digest task so the digest's only blocking work is SQLite I/O.
-pub fn prepare(project: String, event: Event) -> IngestEvent {
+///
+/// Scrubbing comes first, so nothing it removes reaches a title, a log
+/// line, an alert or the database. The SDK's own fingerprint list is the
+/// exception: it is hashed as sent (per-build offsets must keep splitting
+/// groups) and scrubbed before it is stored.
+pub fn prepare(project: String, mut event: Event) -> IngestEvent {
+    crate::scrub::scrub_event(&mut event);
     let fingerprint = fingerprint::derive(&event);
+    if let Some(list) = event.fingerprint.as_mut() {
+        crate::scrub::scrub_strings(list);
+    }
+    let page = pages(&event);
+    let release = event
+        .release
+        .clone()
+        .map(|r| truncate_chars(r, MAX_LABEL_CHARS));
     let title = truncate_chars(event.title(), MAX_LABEL_CHARS);
     let level = event.level.map(level_str);
 
@@ -117,6 +161,8 @@ pub fn prepare(project: String, event: Event) -> IngestEvent {
         received_at: Utc::now(),
         event_id,
         payload,
+        release,
+        page,
         _budget: None,
     }
 }
@@ -125,7 +171,7 @@ pub async fn run(
     store: Store,
     mut events: mpsc::Receiver<IngestEvent>,
     fanout: broadcast::Sender<ServerMessage>,
-    webhooks: mpsc::Sender<webhook::Trigger>,
+    alerts: AlertSinks,
 ) -> Result<(), DaemonError> {
     tracing::info!("digest task started");
 
@@ -151,7 +197,7 @@ pub async fn run(
             }
         }
 
-        process_batch(&store, &fanout, &webhooks, &mut buf).await;
+        process_batch(&store, &fanout, &alerts, &mut buf).await;
     }
 
     tracing::info!("digest task exiting (ingest channel closed)");
@@ -165,7 +211,7 @@ pub async fn run(
 async fn process_batch(
     store: &Store,
     fanout: &broadcast::Sender<ServerMessage>,
-    webhooks: &mpsc::Sender<webhook::Trigger>,
+    alerts: &AlertSinks,
     buf: &mut Vec<IngestEvent>,
 ) {
     if buf.is_empty() {
@@ -226,15 +272,20 @@ async fn process_batch(
             );
         }
 
-        if result.created {
-            let _ = webhooks.try_send(webhook::Trigger {
-                issue: result.issue.clone(),
-                kind: webhook::TriggerKind::NewIssue,
-            });
+        let kind = if rec.page {
+            Some(TriggerKind::Page)
+        } else if result.created {
+            Some(TriggerKind::NewIssue)
         } else if result.regressed {
-            let _ = webhooks.try_send(webhook::Trigger {
+            Some(TriggerKind::Regression)
+        } else {
+            None
+        };
+        if let Some(kind) = kind {
+            alerts.fire(webhook::Trigger {
                 issue: result.issue.clone(),
-                kind: webhook::TriggerKind::Regression,
+                kind,
+                release: rec.release.clone(),
             });
         }
 
@@ -287,6 +338,93 @@ mod tests {
         let ev2 = event_with_exception("Boom", "f", 42);
         let rec2 = prepare("p1".into(), ev2);
         assert_eq!(rec.fingerprint, rec2.fingerprint);
+    }
+
+    fn ev(v: serde_json::Value) -> Event {
+        serde_json::from_value(v).expect("valid event JSON")
+    }
+
+    #[test]
+    fn prepare_scrubs_before_title_and_payload() {
+        let rec = prepare(
+            "p".into(),
+            ev(serde_json::json!({
+                "exception": { "values": [{ "type": "FlashError", "value": "car WBS8M9C50J5K12345" }] },
+                "user": { "ip_address": "203.0.113.9" },
+            })),
+        );
+        assert_eq!(rec.title, "FlashError: car <vin>");
+        assert!(!rec.payload.contains("WBS8M9C50J5K12345"));
+        assert!(!rec.payload.contains("203.0.113.9"));
+    }
+
+    #[test]
+    fn prepare_groups_messages_that_differ_only_by_address() {
+        let a = prepare(
+            "p".into(),
+            ev(serde_json::json!({ "message": "read at 0x80040000" })),
+        );
+        let b = prepare(
+            "p".into(),
+            ev(serde_json::json!({ "message": "read at 0x80041000" })),
+        );
+        assert_eq!(a.fingerprint, b.fingerprint);
+    }
+
+    #[test]
+    fn prepare_hashes_the_sdk_fingerprint_as_sent_and_stores_it_scrubbed() {
+        let raw = |off: &str| {
+            ev(serde_json::json!({
+                "message": "m",
+                "fingerprint": ["unhandled", "E1", off],
+            }))
+        };
+        let a = prepare("p".into(), raw("0x002f5c1f"));
+        let b = prepare("p".into(), raw("0x002f6000"));
+        assert_ne!(
+            a.fingerprint, b.fingerprint,
+            "per-build offsets still split groups"
+        );
+        assert!(a
+            .payload
+            .contains(r#""fingerprint":["unhandled","E1","<hex>"]"#));
+    }
+
+    #[test]
+    fn prepare_pages_on_fatal_erased_flash() {
+        let page = |level: &str, tags: serde_json::Value| {
+            prepare(
+                "p".into(),
+                ev(serde_json::json!({ "level": level, "tags": tags })),
+            )
+            .page
+        };
+        assert!(page("fatal", serde_json::json!({ "flash.erased": "true" })));
+        assert!(page("fatal", serde_json::json!({ "flash.erased": true })));
+        assert!(page("fatal", serde_json::json!([["flash.erased", "true"]])));
+        assert!(!page(
+            "error",
+            serde_json::json!({ "flash.erased": "true" })
+        ));
+        assert!(!page(
+            "fatal",
+            serde_json::json!({ "flash.erased": "false" })
+        ));
+        assert!(!page("fatal", serde_json::json!({})));
+    }
+
+    #[test]
+    fn prepare_carries_the_release() {
+        let rec = prepare(
+            "p".into(),
+            ev(
+                serde_json::json!({ "message": "m", "release": "com.zeusmotorsport.suite@1.2.3+45" }),
+            ),
+        );
+        assert_eq!(
+            rec.release.as_deref(),
+            Some("com.zeusmotorsport.suite@1.2.3+45")
+        );
     }
 
     #[test]

@@ -94,40 +94,6 @@ fn build_clearing_cookie(dev_mode: bool) -> String {
     format!("{COOKIE_NAME}=; HttpOnly{secure}; SameSite=Strict; Path=/; Max-Age=0")
 }
 
-/// Best-effort client-IP extractor.
-///
-/// `trust_proxy_headers` controls whether `X-Forwarded-For` is honoured:
-///
-///   * `false` (default) — ignore XFF entirely; only the direct peer
-///     socket counts. Right default for a daemon reachable without an
-///     authenticated proxy in front: an attacker could otherwise spoof a
-///     fresh "IP" per request and bypass the per-IP lockout policy.
-///   * `true` — trust the first XFF hop. Use only when the daemon sits
-///     behind a reverse proxy that strips client-supplied XFF and
-///     re-writes a single trusted value.
-///
-/// Resolution order (with trust enabled): XFF first hop → peer → "unknown".
-/// "unknown" is a coalesce target — bucket keys must be stable strings, so
-/// Option is wrong here.
-pub fn extract_client_ip(
-    headers: &HeaderMap,
-    peer: Option<SocketAddr>,
-    trust_proxy_headers: bool,
-) -> String {
-    if trust_proxy_headers {
-        if let Some(xff) = headers.get("x-forwarded-for").and_then(|v| v.to_str().ok()) {
-            if let Some(first) = xff.split(',').next() {
-                let trimmed = first.trim();
-                if !trimmed.is_empty() {
-                    return trimmed.to_string();
-                }
-            }
-        }
-    }
-    peer.map(|s| s.ip().to_string())
-        .unwrap_or_else(|| "unknown".to_string())
-}
-
 fn extract_user_agent(headers: &HeaderMap) -> Option<String> {
     headers
         .get("user-agent")
@@ -224,7 +190,7 @@ pub async fn handle_setup(
     // ~one operator click during install and is the highest-value secret
     // we have, so a few wrong tries per window is more than enough.
     // There is no username during setup, so the bucket is IP-only.
-    let setup_ip = extract_client_ip(&headers, peer.map(|c| c.0), state.trust_proxy_headers);
+    let setup_ip = state.client_ip.resolve(&headers, peer.map(|c| c.0));
     let policy = LockoutPolicy::default();
     let since = Utc::now() - policy.window;
     let ip_failures = state
@@ -281,7 +247,7 @@ pub async fn handle_setup(
     // Sign the operator in immediately — they just proved they have host
     // access AND chose a password; making them re-type it would be silly.
     let id = crypto::generate_session_id();
-    let ip = extract_client_ip(&headers, peer.map(|c| c.0), state.trust_proxy_headers);
+    let ip = state.client_ip.resolve(&headers, peer.map(|c| c.0));
     let ua = extract_user_agent(&headers);
     state
         .store
@@ -311,7 +277,7 @@ pub async fn handle_login(
         return Ok((StatusCode::BAD_REQUEST, "missing body").into_response());
     };
     let username = body.username.trim().to_string();
-    let ip = extract_client_ip(&headers, peer.map(|c| c.0), state.trust_proxy_headers);
+    let ip = state.client_ip.resolve(&headers, peer.map(|c| c.0));
 
     // Lockout check: read the recent-failure ledger, decide, before doing
     // any password work. The hash compare is the expensive bit; gating it
@@ -518,51 +484,5 @@ mod tests {
     fn build_clearing_cookie_zeros_max_age() {
         let c = build_clearing_cookie(false);
         assert!(c.contains("Max-Age=0"));
-    }
-
-    #[test]
-    fn extract_client_ip_prefers_xff_when_proxy_trusted() {
-        let mut h = HeaderMap::new();
-        h.insert("x-forwarded-for", HeaderValue::from_static("1.2.3.4"));
-        let peer: SocketAddr = "9.9.9.9:1234".parse().unwrap();
-        assert_eq!(extract_client_ip(&h, Some(peer), true), "1.2.3.4");
-    }
-
-    #[test]
-    fn extract_client_ip_uses_first_xff_hop_when_proxy_trusted() {
-        let mut h = HeaderMap::new();
-        h.insert(
-            "x-forwarded-for",
-            HeaderValue::from_static("1.2.3.4, 5.6.7.8"),
-        );
-        assert_eq!(extract_client_ip(&h, None, true), "1.2.3.4");
-    }
-
-    /// The lockout-bypass scenario: an attacker rotates `X-Forwarded-For`
-    /// per request to look like a fresh "IP" each time. With proxy trust
-    /// off (the default) the daemon ignores XFF entirely and the per-IP
-    /// bucket sees only the real socket peer — so the lockout policy
-    /// holds.
-    #[test]
-    fn extract_client_ip_ignores_xff_when_proxy_untrusted() {
-        let mut h = HeaderMap::new();
-        h.insert("x-forwarded-for", HeaderValue::from_static("1.2.3.4"));
-        let peer: SocketAddr = "9.9.9.9:1234".parse().unwrap();
-        assert_eq!(extract_client_ip(&h, Some(peer), false), "9.9.9.9");
-    }
-
-    #[test]
-    fn extract_client_ip_falls_back_to_peer() {
-        let h = HeaderMap::new();
-        let peer: SocketAddr = "9.9.9.9:1234".parse().unwrap();
-        assert_eq!(extract_client_ip(&h, Some(peer), false), "9.9.9.9");
-        assert_eq!(extract_client_ip(&h, Some(peer), true), "9.9.9.9");
-    }
-
-    #[test]
-    fn extract_client_ip_falls_back_to_unknown_when_nothing() {
-        let h = HeaderMap::new();
-        assert_eq!(extract_client_ip(&h, None, false), "unknown");
-        assert_eq!(extract_client_ip(&h, None, true), "unknown");
     }
 }

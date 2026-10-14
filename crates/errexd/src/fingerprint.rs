@@ -104,6 +104,7 @@ mod tests {
 
     fn ev_with_exception(ty: &str, function: &str, filename: &str, lineno: u32) -> Event {
         Event {
+            other: Default::default(),
             event_id: Uuid::new_v4(),
             timestamp: Utc::now(),
             platform: None,
@@ -114,11 +115,14 @@ mod tests {
             message: None,
             exception: Some(ExceptionContainer {
                 values: vec![ExceptionInfo {
+                    other: Default::default(),
                     ty: Some(ty.into()),
                     value: None,
                     module: None,
                     stacktrace: Some(Stacktrace {
+                        other: Default::default(),
                         frames: vec![Frame {
+                            other: Default::default(),
                             filename: Some(filename.into()),
                             function: Some(function.into()),
                             module: None,
@@ -142,6 +146,7 @@ mod tests {
 
     fn ev_message(msg: &str) -> Event {
         Event {
+            other: Default::default(),
             event_id: Uuid::new_v4(),
             timestamp: Utc::now(),
             platform: None,
@@ -164,6 +169,7 @@ mod tests {
 
     fn ev_empty() -> Event {
         Event {
+            other: Default::default(),
             event_id: Uuid::new_v4(),
             timestamp: Utc::now(),
             platform: None,
@@ -294,11 +300,13 @@ mod tests {
     fn logentry_message_groups_message_only_events() {
         let mut a = ev_empty();
         a.logentry = Some(errex_proto::LogEntry {
+            other: Default::default(),
             message: Some("cache miss".into()),
             formatted: None,
         });
         let mut b = ev_empty();
         b.logentry = Some(errex_proto::LogEntry {
+            other: Default::default(),
             message: Some("cache miss".into()),
             formatted: None,
         });
@@ -314,6 +322,7 @@ mod tests {
             .unwrap()
             .frames;
         frames.push(Frame {
+            other: Default::default(),
             filename: Some("app.js".into()),
             function: Some("handler".into()),
             module: None,
@@ -322,6 +331,7 @@ mod tests {
             in_app: Some(true),
         });
         frames.push(Frame {
+            other: Default::default(),
             filename: Some("lib.js".into()),
             function: Some("deep".into()),
             module: None,
@@ -360,11 +370,13 @@ mod tests {
     fn formatted_log_params_group_by_template() {
         let mut a = ev_empty();
         a.logentry = Some(errex_proto::LogEntry {
+            other: Default::default(),
             message: Some("user %s logged in".into()),
             formatted: Some("user alice logged in".into()),
         });
         let mut b = ev_empty();
         b.logentry = Some(errex_proto::LogEntry {
+            other: Default::default(),
             message: Some("user %s logged in".into()),
             formatted: Some("user bob logged in".into()),
         });

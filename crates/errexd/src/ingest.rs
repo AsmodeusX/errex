@@ -15,6 +15,7 @@ use std::sync::Arc;
 
 use axum::body::Bytes;
 use axum::extract::{Path, Query, State};
+use axum::http::header::RETRY_AFTER;
 use axum::http::{HeaderName, HeaderValue, Method, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -63,10 +64,9 @@ pub struct AppState {
     /// localhost are accepted by browsers (which refuse `Secure` over
     /// non-https).
     pub dev_mode: bool,
-    /// When true, the per-IP lockout bucket reads `X-Forwarded-For`
-    /// instead of the direct peer socket. Off by default — see
-    /// [`crate::auth::extract_client_ip`] for the rationale.
-    pub trust_proxy_headers: bool,
+    /// Where the login/setup lockout reads the client address from. See
+    /// [`crate::client_ip`]; ingest never reads it.
+    pub client_ip: crate::client_ip::ClientIpPolicy,
     /// Process-lifetime counters surfaced via `/metrics`.
     pub metrics: Arc<Metrics>,
     /// Capacity of the webhook channel, surfaced through `/metrics` so
@@ -117,7 +117,8 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             CorsLayer::new()
                 .allow_origin(tower_http::cors::Any)
                 .allow_methods([Method::POST, Method::OPTIONS])
-                .allow_headers(tower_http::cors::Any),
+                .allow_headers(tower_http::cors::Any)
+                .expose_headers([RETRY_AFTER, X_SENTRY_RATE_LIMITS]),
         );
 
     Router::new()
@@ -268,6 +269,8 @@ frame-ancestors 'none'; \
 base-uri 'none'; \
 form-action 'self'; \
 object-src 'none'";
+
+const X_SENTRY_RATE_LIMITS: HeaderName = HeaderName::from_static("x-sentry-rate-limits");
 
 pub async fn serve(addr: SocketAddr, state: Arc<AppState>) -> Result<(), DaemonError> {
     let dev_mode = state.dev_mode;
@@ -1042,12 +1045,22 @@ async fn ingest_envelope(
 
     // Rate limit AFTER auth so unauthenticated traffic doesn't fill the
     // limiter map and DoS legitimate projects.
-    if !state
+    if let Err(retry_after) = state
         .rate_limiter
         .check(&project, std::time::Instant::now())
     {
         state.metrics.inc_rejected_rate_limit();
-        return (StatusCode::TOO_MANY_REQUESTS, "rate limit exceeded").into_response();
+        // Sentry SDKs back off on X-Sentry-Rate-Limits (empty categories =
+        // every category) and fall back to Retry-After.
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            [
+                (RETRY_AFTER, retry_after.to_string()),
+                (X_SENTRY_RATE_LIMITS, format!("{retry_after}::project")),
+            ],
+            "rate limit exceeded",
+        )
+            .into_response();
     }
     let raw_charge = match state
         .ingest_budget

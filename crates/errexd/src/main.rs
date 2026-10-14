@@ -11,6 +11,7 @@ use tokio::signal;
 use tokio::sync::{broadcast, mpsc};
 
 mod auth;
+mod client_ip;
 mod config;
 mod crypto;
 mod digest;
@@ -22,8 +23,10 @@ mod mcp;
 mod metrics;
 mod rate_limit;
 mod retention;
+mod scrub;
 mod spa;
 mod store;
+mod telegram;
 mod triage;
 mod user_agent;
 mod webhook;
@@ -91,6 +94,9 @@ const INGEST_INFLIGHT: usize = 128;
 /// messages silently — the next snapshot they pull will catch them up.
 const FANOUT_CHANNEL_CAPACITY: usize = 64;
 
+/// Telegram channel: same triggers as the webhook channel, its own task.
+const TELEGRAM_CHANNEL_CAPACITY: usize = 64;
+
 /// Webhook channel: outbound notifications are infrequent (new issues +
 /// regressions only). A backed-up channel only loses alerts, which is
 /// preferable to back-pressuring digest. Surfaced via /metrics so a full
@@ -116,6 +122,8 @@ async fn main() -> anyhow::Result<()> {
 
     let cfg = cli.config;
     init_tracing(&cfg.log_level);
+    let client_ip = cfg.client_ip_policy().map_err(anyhow::Error::msg)?;
+    let telegram_cfg = cfg.telegram().map_err(anyhow::Error::msg)?;
 
     // Storage: the file's parent must exist before SQLite will create it.
     tokio::fs::create_dir_all(&cfg.data_dir)
@@ -138,12 +146,24 @@ async fn main() -> anyhow::Result<()> {
     // issues + regressions only). A backed-up channel only loses alerts,
     // which is preferable to backpressuring digest.
     let (webhook_tx, webhook_rx) = mpsc::channel(WEBHOOK_CHANNEL_CAPACITY);
+    let (telegram_tx, telegram_handle) = match telegram_cfg {
+        Some(tg) => {
+            let (tx, rx) = mpsc::channel(TELEGRAM_CHANNEL_CAPACITY);
+            let public_url = cfg.public_url.clone();
+            let handle = tokio::spawn(async move { telegram::run(tg, public_url, rx).await });
+            (Some(tx), Some(handle))
+        }
+        None => (None, None),
+    };
 
     let digest_handle = {
         let store = store.clone();
         let fanout = fanout_tx.clone();
-        let webhooks = webhook_tx.clone();
-        tokio::spawn(async move { digest::run(store, event_rx, fanout, webhooks).await })
+        let alerts = webhook::AlertSinks {
+            webhook: webhook_tx.clone(),
+            telegram: telegram_tx,
+        };
+        tokio::spawn(async move { digest::run(store, event_rx, fanout, alerts).await })
     };
 
     let webhook_handle = {
@@ -167,7 +187,7 @@ async fn main() -> anyhow::Result<()> {
         setup_token: cfg.admin_token.clone().filter(|s| !s.is_empty()),
         public_url: cfg.public_url.clone(),
         dev_mode: cfg.dev_mode,
-        trust_proxy_headers: cfg.trust_proxy_headers,
+        client_ip,
         metrics: metrics_handle.clone(),
         webhook_capacity: WEBHOOK_CHANNEL_CAPACITY,
         webhook_sender: webhook_tx.clone(),
@@ -180,8 +200,12 @@ async fn main() -> anyhow::Result<()> {
     let mcp_handle = tokio::spawn(mcp::serve(cfg.mcp_addr()));
     let retention_handle = {
         let store = store.clone();
-        let days = cfg.retention_days;
-        tokio::spawn(async move { retention::run(store, days).await })
+        let defaults = retention::Defaults {
+            days: cfg.retention_days,
+            events_per_issue_max: cfg.events_per_issue_max,
+            issues_per_project_max: cfg.issues_per_project_max,
+        };
+        tokio::spawn(async move { retention::run(store, defaults).await })
     };
 
     tracing::info!(
@@ -216,6 +240,12 @@ async fn main() -> anyhow::Result<()> {
         res = digest_handle => res.context("digest task panicked")?.context("digest")?,
         res = retention_handle => res.context("retention task panicked")?,
         res = webhook_handle => res.context("webhook task panicked")?,
+        res = async {
+            match telegram_handle {
+                Some(h) => h.await,
+                None => std::future::pending().await,
+            }
+        } => res.context("telegram task panicked")?,
         _ = shutdown_signal() => tracing::info!("shutdown signal received"),
     }
 

@@ -3,6 +3,19 @@ use std::path::PathBuf;
 
 use clap::Parser;
 
+use crate::client_ip::{self, ClientIpPolicy};
+use crate::telegram::TelegramConfig;
+
+/// `host:port`, bracketing a bare IPv6 host (`::1` -> `[::1]:9090`).
+fn bind_addr(host: &str, port: u16) -> Result<SocketAddr, std::net::AddrParseError> {
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    if host.contains(':') {
+        format!("[{host}]:{port}").parse()
+    } else {
+        format!("{host}:{port}").parse()
+    }
+}
+
 /// Daemon configuration. Every flag also reads from an `ERREX_*` env var so
 /// `docker compose` can configure without overriding the entrypoint.
 #[derive(Debug, Clone, Parser)]
@@ -69,6 +82,18 @@ pub struct Config {
     #[arg(long, env = "ERREX_RETENTION_DAYS", default_value_t = 30)]
     pub retention_days: u32,
 
+    /// Payloads kept per issue; older ones roll off hourly while the issue
+    /// row (counts, first/last seen) stays. The admin UI's value wins when
+    /// it is non-zero. `0` here and there = unlimited. Sized so a public DSN
+    /// cannot fill a small disk: one noisy issue keeps 200 samples.
+    #[arg(long, env = "ERREX_EVENTS_PER_ISSUE_MAX", default_value_t = 200)]
+    pub events_per_issue_max: u32,
+
+    /// Issues kept per project; the least recently seen are dropped hourly.
+    /// Same precedence and `0` meaning as `events_per_issue_max`.
+    #[arg(long, env = "ERREX_ISSUES_PER_PROJECT_MAX", default_value_t = 5000)]
+    pub issues_per_project_max: u32,
+
     /// Per-project ingest rate cap, events per minute. `0` = unlimited.
     /// The bucket also has burst capacity (`rate_limit_burst`) so short
     /// spikes don't get truncated; only sustained over-rate is rejected.
@@ -111,6 +136,53 @@ pub struct Config {
     /// `ERREX_TRUST_PROXY_HEADERS=true`.
     #[arg(long, env = "ERREX_TRUST_PROXY_HEADERS", default_value_t = false)]
     pub trust_proxy_headers: bool,
+
+    /// Read the client address from Cloudflare's `CF-Connecting-IP`, but only
+    /// on connections from `cloudflare_trusted_peers`. For a daemon behind
+    /// Cloudflare's proxy. Exclusive with `trust_proxy_headers`.
+    #[arg(long, env = "ERREX_CLOUDFLARE_CLIENT_IP", default_value_t = false)]
+    pub cloudflare_client_ip: bool,
+
+    /// Comma-separated peers whose `CF-Connecting-IP` is believed. The word
+    /// `cloudflare` is Cloudflare's published ranges; add the local reverse
+    /// proxy (e.g. `::1/128`) when one sits in between and itself admits
+    /// only Cloudflare.
+    #[arg(
+        long,
+        env = "ERREX_CLOUDFLARE_TRUSTED_PEERS",
+        value_delimiter = ',',
+        default_value = "cloudflare"
+    )]
+    pub cloudflare_trusted_peers: Vec<String>,
+
+    /// File holding the Telegram bot token (from @BotFather). Preferred over
+    /// `telegram_bot_token`: under systemd use `LoadCredential=` and point
+    /// this at `%d/<name>`. Telegram alerts are on when a token and
+    /// `telegram_chat_id` are both set.
+    #[arg(long, env = "ERREX_TELEGRAM_BOT_TOKEN_FILE")]
+    pub telegram_bot_token_file: Option<PathBuf>,
+
+    /// Telegram bot token, when a file is not practical.
+    #[arg(long, env = "ERREX_TELEGRAM_BOT_TOKEN", hide_env_values = true)]
+    pub telegram_bot_token: Option<String>,
+
+    /// Chat to alert: a group or channel id (`-100…`) or `@channelname`.
+    #[arg(long, env = "ERREX_TELEGRAM_CHAT_ID", allow_hyphen_values = true)]
+    pub telegram_chat_id: Option<String>,
+
+    /// Bot API base URL. Changed only by tests.
+    #[arg(
+        long,
+        env = "ERREX_TELEGRAM_API_BASE",
+        default_value = "https://api.telegram.org"
+    )]
+    pub telegram_api_base: String,
+
+    /// Telegram messages per minute for new issues and regressions; the rest
+    /// are counted and reported in the next message. Pages have their own
+    /// budget at Telegram's group limit.
+    #[arg(long, env = "ERREX_TELEGRAM_MAX_PER_MIN", default_value_t = 10)]
+    pub telegram_max_per_min: u32,
 }
 
 impl Config {
@@ -128,15 +200,61 @@ impl Config {
     }
 
     pub fn http_addr(&self) -> SocketAddr {
-        format!("{}:{}", self.http_host, self.resolved_http_port())
-            .parse()
-            .expect("valid http bind addr")
+        bind_addr(&self.http_host, self.resolved_http_port()).expect("valid http bind addr")
     }
 
     pub fn mcp_addr(&self) -> SocketAddr {
-        format!("{}:{}", self.mcp_host, self.mcp_port)
-            .parse()
-            .expect("valid mcp bind addr")
+        bind_addr(&self.mcp_host, self.mcp_port).expect("valid mcp bind addr")
+    }
+
+    pub fn client_ip_policy(&self) -> Result<ClientIpPolicy, String> {
+        match (self.cloudflare_client_ip, self.trust_proxy_headers) {
+            (true, true) => {
+                Err("ERREX_CLOUDFLARE_CLIENT_IP and ERREX_TRUST_PROXY_HEADERS are exclusive".into())
+            }
+            (true, false) => {
+                let trusted = client_ip::parse_trusted(&self.cloudflare_trusted_peers)?;
+                if trusted.is_empty() {
+                    return Err("ERREX_CLOUDFLARE_TRUSTED_PEERS is empty".into());
+                }
+                Ok(ClientIpPolicy::Cloudflare { trusted })
+            }
+            (false, true) => Ok(ClientIpPolicy::ForwardedFor),
+            (false, false) => Ok(ClientIpPolicy::Peer),
+        }
+    }
+
+    /// Telegram settings, `None` when alerts are not configured. Half a
+    /// configuration is an error rather than silence.
+    pub fn telegram(&self) -> Result<Option<TelegramConfig>, String> {
+        let token = match &self.telegram_bot_token_file {
+            Some(path) => Some(
+                std::fs::read_to_string(path)
+                    .map_err(|e| format!("reading telegram token file {}: {e}", path.display()))?,
+            ),
+            None => self.telegram_bot_token.clone(),
+        };
+        let token = token
+            .map(|t| t.trim().to_string())
+            .filter(|t| !t.is_empty());
+        let chat_id = self
+            .telegram_chat_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|c| !c.is_empty());
+        match (token, chat_id) {
+            (None, None) => Ok(None),
+            (Some(token), Some(chat_id)) => Ok(Some(TelegramConfig {
+                api_base: self.telegram_api_base.trim_end_matches('/').to_string(),
+                token,
+                chat_id: chat_id.to_string(),
+                max_per_min: self.telegram_max_per_min,
+            })),
+            (Some(_), None) => {
+                Err("a Telegram bot token is set but ERREX_TELEGRAM_CHAT_ID is not".into())
+            }
+            (None, Some(_)) => Err("ERREX_TELEGRAM_CHAT_ID is set but no bot token is".into()),
+        }
     }
 
     /// Default `public_url` is the local-loopback fallback. Detect it so
@@ -206,6 +324,92 @@ mod tests {
     /// explicitly opts out. Without this, a public daemon would happily
     /// accept anonymous events from anyone on the network and let an
     /// attacker exhaust the digest budget.
+    #[test]
+    fn ipv6_hosts_bind() {
+        let cfg = Config::parse_from(["errexd", "--http-host", "::1", "--http-port", "9090"]);
+        assert_eq!(cfg.http_addr(), "[::1]:9090".parse().unwrap());
+        let cfg = Config::parse_from(["errexd", "--http-host", "[::1]", "--http-port", "9090"]);
+        assert_eq!(cfg.http_addr(), "[::1]:9090".parse().unwrap());
+        let cfg = Config::parse_from(["errexd", "--mcp-host", "::1"]);
+        assert_eq!(cfg.mcp_addr(), "[::1]:9092".parse().unwrap());
+    }
+
+    #[test]
+    fn caps_default_to_bounded_values() {
+        let cfg = Config::parse_from(["errexd"]);
+        assert_eq!(cfg.events_per_issue_max, 200);
+        assert_eq!(cfg.issues_per_project_max, 5000);
+    }
+
+    #[test]
+    fn client_ip_policy_follows_the_flags() {
+        let cfg = Config::parse_from(["errexd"]);
+        assert_eq!(cfg.client_ip_policy().unwrap(), ClientIpPolicy::Peer);
+        let cfg = Config::parse_from(["errexd", "--trust-proxy-headers"]);
+        assert_eq!(
+            cfg.client_ip_policy().unwrap(),
+            ClientIpPolicy::ForwardedFor
+        );
+        let cfg = Config::parse_from([
+            "errexd",
+            "--cloudflare-client-ip",
+            "--cloudflare-trusted-peers",
+            "cloudflare,::1/128",
+        ]);
+        match cfg.client_ip_policy().unwrap() {
+            ClientIpPolicy::Cloudflare { trusted } => {
+                assert_eq!(trusted.len(), client_ip::CLOUDFLARE_RANGES.len() + 1)
+            }
+            other => panic!("expected Cloudflare, got {other:?}"),
+        }
+        let both =
+            Config::parse_from(["errexd", "--cloudflare-client-ip", "--trust-proxy-headers"]);
+        assert!(both.client_ip_policy().is_err());
+        let bad = Config::parse_from([
+            "errexd",
+            "--cloudflare-client-ip",
+            "--cloudflare-trusted-peers",
+            "not-a-range",
+        ]);
+        assert!(bad.client_ip_policy().is_err());
+    }
+
+    #[test]
+    fn telegram_is_off_unless_configured() {
+        let cfg = Config::parse_from(["errexd"]);
+        assert!(cfg.telegram().unwrap().is_none());
+    }
+
+    #[test]
+    fn telegram_token_file_is_read_and_trimmed() {
+        let dir = std::env::temp_dir().join(format!("errexd-tg-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("token");
+        std::fs::write(&file, "123:abc\n").unwrap();
+        let cfg = Config::parse_from([
+            "errexd",
+            "--telegram-bot-token-file",
+            file.to_str().unwrap(),
+            "--telegram-chat-id",
+            "-1001234",
+            "--telegram-api-base",
+            "http://127.0.0.1:1/",
+        ]);
+        let tg = cfg.telegram().unwrap().unwrap();
+        assert_eq!(tg.token, "123:abc");
+        assert_eq!(tg.chat_id, "-1001234");
+        assert_eq!(tg.api_base, "http://127.0.0.1:1");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn half_a_telegram_configuration_is_an_error() {
+        let cfg = Config::parse_from(["errexd", "--telegram-bot-token", "123:abc"]);
+        assert!(cfg.telegram().is_err());
+        let cfg = Config::parse_from(["errexd", "--telegram-chat-id", "-100"]);
+        assert!(cfg.telegram().is_err());
+    }
+
     #[test]
     fn require_auth_default_is_true() {
         let cfg = Config::parse_from(["errexd"]);

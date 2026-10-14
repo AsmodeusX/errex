@@ -60,6 +60,7 @@ async fn fresh_store() -> (Store, PathBuf) {
 
 fn sample_event(ty: &str, value: &str, function: &str, lineno: u32) -> Event {
     Event {
+        other: Default::default(),
         event_id: Uuid::new_v4(),
         timestamp: Utc::now(),
         platform: Some("javascript".into()),
@@ -70,11 +71,14 @@ fn sample_event(ty: &str, value: &str, function: &str, lineno: u32) -> Event {
         message: None,
         exception: Some(ExceptionContainer {
             values: vec![ExceptionInfo {
+                other: Default::default(),
                 ty: Some(ty.into()),
                 value: Some(value.into()),
                 module: None,
                 stacktrace: Some(Stacktrace {
+                    other: Default::default(),
                     frames: vec![Frame {
+                        other: Default::default(),
                         filename: Some("app.js".into()),
                         function: Some(function.into()),
                         module: None,
