@@ -15,10 +15,20 @@ self-host.
 | `ERREX_MCP_PORT` | `9092` | MCP listener (stub) |
 | `ERREX_LOG_LEVEL` | `info` | tracing filter |
 | `ERREX_DEV_MODE` | `false` | Enable CORS for the Vite dev server |
-| `ERREX_REQUIRE_AUTH` | `false` | Validate `sentry_key` on ingest |
+| `ERREX_HOST` | `127.0.0.1` | HTTP bind address. A bare IPv6 address (`::1`) is accepted. |
+| `ERREX_REQUIRE_AUTH` | `true` | Validate `sentry_key` on ingest. Set `false` only on a private network. |
 | `ERREX_RETENTION_DAYS` | `30` | Purge events older than N days; `0` disables |
-| `ERREX_RATE_LIMIT_PER_MIN` | `6000` | Per-project ingest cap; `0` = unlimited |
+| `ERREX_EVENTS_PER_ISSUE_MAX` | `200` | Payloads kept per issue (issue counts survive); `0` = unlimited |
+| `ERREX_ISSUES_PER_PROJECT_MAX` | `5000` | Issues kept per project, least recently seen dropped first; `0` = unlimited |
+| `ERREX_RATE_LIMIT_PER_MIN` | `6000` | Per-project ingest cap; `0` = unlimited. A 429 carries `Retry-After` and `X-Sentry-Rate-Limits`. |
 | `ERREX_RATE_LIMIT_BURST` | `200` | Token-bucket burst capacity |
+| `ERREX_TRUST_PROXY_HEADERS` | `false` | Login lockout reads the first `X-Forwarded-For` hop |
+| `ERREX_CLOUDFLARE_CLIENT_IP` | `false` | Login lockout reads `CF-Connecting-IP`, believed only from `ERREX_CLOUDFLARE_TRUSTED_PEERS`. Exclusive with `ERREX_TRUST_PROXY_HEADERS`. |
+| `ERREX_CLOUDFLARE_TRUSTED_PEERS` | `cloudflare` | Comma-separated CIDRs; `cloudflare` = Cloudflare's published ranges. Add `::1/128` when a local reverse proxy that admits only Cloudflare sits in between. |
+| `ERREX_TELEGRAM_BOT_TOKEN_FILE` | _(unset)_ | File holding the Telegram bot token (preferred; works with systemd `LoadCredential=`) |
+| `ERREX_TELEGRAM_BOT_TOKEN` | _(unset)_ | Telegram bot token, when a file is not practical |
+| `ERREX_TELEGRAM_CHAT_ID` | _(unset)_ | Group or channel to alert (`-100…` or `@name`). Telegram alerts are on when this and a token are set. |
+| `ERREX_TELEGRAM_MAX_PER_MIN` | `10` | Telegram messages per minute for new issues and regressions; `0` = unlimited. Pages have their own budget. |
 | `ERREX_PUBLIC_URL` | `http://localhost:9090` | **Set this for any non-localhost deployment.** Embedded in DSNs, webhook payloads, and the dashboard's curl example. The daemon warns at boot if you bound to a public interface but left this at the default. |
 | `ERREX_ADMIN_TOKEN` | _(unset)_ | Setup-wizard token; required to bootstrap the first admin user |
 
@@ -151,8 +161,8 @@ The `dsn` is the canonical Sentry shape — every official SDK parses it.
 The `ingest_url` is for hand-testing with curl; the SDK derives it
 internally from the DSN.
 
-To require this token on ingest, set `ERREX_REQUIRE_AUTH=true`. Off by
-default — fine when the daemon is on a private network.
+Ingest requires this token by default. `ERREX_REQUIRE_AUTH=false` turns
+the check off, which is only reasonable on a private network.
 
 ## Wiring up an SDK
 
@@ -196,7 +206,48 @@ all accept the same shape.
 errexd project set-webhook my-app https://hooks.slack.com/services/T0/B0/XXXX
 ```
 
-Muted and ignored issues never fire webhooks.
+Muted and ignored issues never fire webhooks, with one exception: a
+**page**. An event with level `fatal` and the tag `flash.erased=true`
+(an ECU left with erased flash) alerts on every occurrence, whatever the
+issue's state.
+
+## Telegram alerts
+
+One bot posts to one group or channel, on the same triggers as the
+webhooks plus pages. Each message names the project, level, title,
+release, event count and the issue's dashboard link. New issues and
+regressions share `ERREX_TELEGRAM_MAX_PER_MIN`; what that holds back is
+counted in the next message. Pages have their own budget at Telegram's
+group limit, so a burst of new issues cannot delay one.
+
+```bash
+ERREX_TELEGRAM_BOT_TOKEN_FILE=/run/credentials/errexd.service/telegram_bot_token
+ERREX_TELEGRAM_CHAT_ID=-1001234567890
+```
+
+A token without a chat id, or the reverse, stops the daemon at boot.
+
+## What ingest keeps
+
+Every field an SDK sends is kept, including ones errex does not model
+(`debug_meta`, `sdk`, `dist`, `threads`, an exception's `mechanism`, a
+frame's `instruction_addr`), and returned by `/api/issues/:id/event`. The
+dashboard shows them under **Additional data**.
+
+Before anything is stored, logged or alerted on, the daemon scrubs the
+event:
+
+- `user` and `request` are dropped, and so is every key the licensing
+  server refuses as non-metadata (`attachment`, `crash_dump`,
+  `screenshot`, `calibration`, `zfl`, `zfle`, `diff`, … — see
+  `crates/errexd/src/scrub.rs`), at any depth, plus frame `vars`.
+- In messages, exception values, breadcrumbs, tags and `extra`: VINs
+  become `<vin>`, `0x` plus 4+ hex digits and bare hex runs of 8+ become
+  `<hex>`, e-mail addresses `<email>`, Bearer tokens, JWTs and long
+  base64 runs `<secret>`. `extra.dart_stack` keeps its hex so it can be
+  symbolicated.
+
+Ingest never reads, logs or stores the client's address.
 
 ## Dashboard keyboard shortcuts
 
