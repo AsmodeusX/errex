@@ -46,6 +46,28 @@ where
     }
 }
 
+/// Sentry's top-level `message` is the log entry interface under its legacy
+/// name: a plain string, or an object `{message, formatted, params}` as
+/// sentry-dart and sentry-java send it. Relay accepts both; a string-only
+/// field refused the whole envelope with "invalid type: map, expected a
+/// string". The object gives its formatted text, else its template.
+fn deserialize_sentry_message<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    use serde::de::Error;
+
+    match Option::<Value>::deserialize(deserializer)? {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(s)) => Ok(Some(s)),
+        Some(Value::Object(entry)) => Ok(["formatted", "message"]
+            .iter()
+            .find_map(|key| entry.get(*key).and_then(Value::as_str))
+            .map(str::to_owned)),
+        Some(_) => Err(D::Error::custom("expected string or object for message")),
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct LogEntry {
     #[serde(default)]
@@ -86,7 +108,7 @@ pub struct Event {
     #[serde(default)]
     pub server_name: Option<String>,
 
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_sentry_message")]
     pub message: Option<String>,
 
     #[serde(default, skip_serializing_if = "Option::is_none")]

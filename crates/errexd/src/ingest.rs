@@ -1286,6 +1286,48 @@ mod tests {
         )
     }
 
+    fn envelope_of(body: &str) -> String {
+        let item_header = format!(r#"{{"type":"event","length":{}}}"#, body.len());
+        format!("{}\n{}\n{}\n", header(), item_header, body)
+    }
+
+    #[test]
+    fn message_is_a_string_or_the_log_entry_object() {
+        // The Zeus app's build 4 sent the log entry interface under its
+        // legacy name, as sentry-dart does; errexd refused the envelope.
+        let object = r#"{"event_id":"3305d402558a4ba5870509796fc50ab4","timestamp":1792152000.123,"platform":"dart","level":"error","environment":"production","release":"com.zeusmotorsport.suite@0.1.0+4","logger":"zeus.reporter","message":{"formatted":"Flash stopped at step 3"},"exception":{"values":[{"type":"flash_failed","value":"Flash stopped at step 3"}]},"fingerprint":["flash","timeout"]}"#;
+        let events = parse_envelope(envelope_of(object).as_bytes()).unwrap();
+        assert_eq!(
+            events[0].message.as_deref(),
+            Some("Flash stopped at step 3")
+        );
+
+        let template = r#"{"message":{"message":"user %s logged in","params":["a"]}}"#;
+        let events = parse_envelope(envelope_of(template).as_bytes()).unwrap();
+        assert_eq!(events[0].message.as_deref(), Some("user %s logged in"));
+
+        let plain = r#"{"message":"plain text"}"#;
+        let events = parse_envelope(envelope_of(plain).as_bytes()).unwrap();
+        assert_eq!(events[0].message.as_deref(), Some("plain text"));
+
+        let null = r#"{"message":null}"#;
+        let events = parse_envelope(envelope_of(null).as_bytes()).unwrap();
+        assert_eq!(events[0].message, None);
+
+        // The app's current shape: the canonical key.
+        let logentry = r#"{"logentry":{"formatted":"Flash stopped"},"exception":{"values":[{"type":"flash_failed","value":"Flash stopped"}]}}"#;
+        let events = parse_envelope(envelope_of(logentry).as_bytes()).unwrap();
+        assert_eq!(
+            events[0]
+                .logentry
+                .as_ref()
+                .and_then(|l| l.formatted.as_deref()),
+            Some("Flash stopped")
+        );
+
+        assert!(parse_envelope(envelope_of(r#"{"message":42}"#).as_bytes()).is_err());
+    }
+
     #[test]
     fn parses_single_event_with_length_prefix() {
         let body = event_body("Boom");
