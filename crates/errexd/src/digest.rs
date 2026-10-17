@@ -84,6 +84,94 @@ pub fn pages(event: &Event) -> bool {
         }
 }
 
+/// Inbound drop rules (`ERREX_DROP_EVENTS`): events an operator never wants
+/// stored, such as what app builds already in the field send for a user's
+/// own situation. Rules are separated by `;`; each is an exception type,
+/// optionally with conditions on tags that must all hold:
+///
+/// ```text
+/// licensing_refused:api.status=401|403|404 ; flash_ok ;
+/// flash_failed:flash.erased=false,flash.kind=adapter|timeout
+/// ```
+///
+/// A tag holds when its value, as a string, is one of the `|`-separated
+/// values; a missing tag never holds.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DropRules(Vec<DropRule>);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DropRule {
+    exception_type: String,
+    tags: Vec<(String, Vec<String>)>,
+}
+
+impl DropRules {
+    pub fn parse(spec: &str) -> Result<Self, String> {
+        let mut rules = Vec::new();
+        for rule in spec.split(';').map(str::trim).filter(|r| !r.is_empty()) {
+            let (ty, conditions) = match rule.split_once(':') {
+                Some((ty, rest)) => (ty.trim(), Some(rest)),
+                None => (rule, None),
+            };
+            if ty.is_empty() || ty.contains(char::is_whitespace) {
+                return Err(format!("drop rule `{rule}`: no exception type"));
+            }
+            let mut tags = Vec::new();
+            for condition in conditions.into_iter().flat_map(|c| c.split(',')) {
+                let Some((key, values)) = condition.split_once('=') else {
+                    return Err(format!(
+                        "drop rule `{rule}`: `{condition}` is not tag=value"
+                    ));
+                };
+                let values: Vec<String> = values
+                    .split('|')
+                    .map(str::trim)
+                    .filter(|v| !v.is_empty())
+                    .map(str::to_string)
+                    .collect();
+                let key = key.trim();
+                if key.is_empty() || values.is_empty() {
+                    return Err(format!(
+                        "drop rule `{rule}`: `{condition}` is not tag=value"
+                    ));
+                }
+                tags.push((key.to_string(), values));
+            }
+            rules.push(DropRule {
+                exception_type: ty.to_string(),
+                tags,
+            });
+        }
+        Ok(Self(rules))
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// Whether `event` matches a rule and is dropped at ingest.
+    pub fn drops(&self, event: &Event) -> bool {
+        if self.0.is_empty() {
+            return false;
+        }
+        let Some(ty) = event.primary_exception().and_then(|e| e.ty.as_deref()) else {
+            return false;
+        };
+        self.0.iter().any(|rule| {
+            rule.exception_type == ty
+                && rule.tags.iter().all(|(key, values)| {
+                    let value = match tag_value(event.tags.as_ref(), key) {
+                        Some(Value::String(s)) => s.clone(),
+                        Some(Value::Number(n)) => n.to_string(),
+                        Some(Value::Bool(b)) => b.to_string(),
+                        _ => return false,
+                    };
+                    values.contains(&value)
+                })
+        })
+    }
+}
+
 /// Tags arrive as an object or as `[key, value]` pairs.
 fn tag_value<'a>(tags: Option<&'a Value>, key: &str) -> Option<&'a Value> {
     match tags? {
@@ -411,6 +499,65 @@ mod tests {
             serde_json::json!({ "flash.erased": "false" })
         ));
         assert!(!page("fatal", serde_json::json!({})));
+    }
+
+    fn licensing(status: serde_json::Value) -> Event {
+        ev(serde_json::json!({
+            "level": "warning",
+            "exception": { "values": [{ "type": "licensing_refused", "value": "v" }] },
+            "tags": { "api.status": status, "api.code": "bad_credentials" },
+        }))
+    }
+
+    #[test]
+    fn drop_rules_match_the_type_and_every_tag_condition() {
+        let rules = DropRules::parse(
+            " licensing_refused:api.status=401|403|404|409|410|429 ; flash_ok;\
+             flash_failed:flash.erased=false,flash.kind=adapter|timeout ",
+        )
+        .unwrap();
+        assert!(rules.drops(&licensing(serde_json::json!("401"))));
+        assert!(rules.drops(&licensing(serde_json::json!(429))));
+        assert!(!rules.drops(&licensing(serde_json::json!("500"))));
+        assert!(!rules.drops(&licensing(serde_json::json!("400"))));
+
+        let typed = |ty: &str, tags: serde_json::Value| {
+            ev(serde_json::json!({
+                "exception": { "values": [{ "type": ty, "value": "v" }] },
+                "tags": tags,
+            }))
+        };
+        assert!(rules.drops(&typed("flash_ok", serde_json::json!({}))));
+        assert!(!rules.drops(&typed("flash_okay", serde_json::json!({}))));
+        let flash = |erased: &str, kind: &str| {
+            typed(
+                "flash_failed",
+                serde_json::json!([["flash.erased", erased], ["flash.kind", kind]]),
+            )
+        };
+        assert!(rules.drops(&flash("false", "adapter")));
+        assert!(
+            !rules.drops(&flash("true", "adapter")),
+            "all conditions hold"
+        );
+        assert!(!rules.drops(&flash("false", "rejected")));
+        assert!(
+            !rules.drops(&typed("flash_failed", serde_json::json!({}))),
+            "a missing tag never holds"
+        );
+        assert!(!rules.drops(&ev(serde_json::json!({ "message": "flash_ok" }))));
+    }
+
+    #[test]
+    fn drop_rules_parse_strictly() {
+        assert!(DropRules::parse("").unwrap().is_empty());
+        assert!(DropRules::parse(" ; ").unwrap().is_empty());
+        assert!(!DropRules::default().drops(&licensing(serde_json::json!("401"))));
+        assert!(DropRules::parse(":api.status=401").is_err());
+        assert!(DropRules::parse("licensing_refused:api.status").is_err());
+        assert!(DropRules::parse("licensing_refused:api.status=").is_err());
+        assert!(DropRules::parse("licensing_refused:=401").is_err());
+        assert!(DropRules::parse("two words").is_err());
     }
 
     #[test]

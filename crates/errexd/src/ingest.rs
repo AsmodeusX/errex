@@ -82,6 +82,8 @@ pub struct AppState {
     /// Byte budget (1 KiB permits) for expanded envelopes in flight, released
     /// when the digest task persists their events.
     pub ingest_budget: Arc<tokio::sync::Semaphore>,
+    /// Operator rules for events answered 200 and never stored.
+    pub drop_rules: crate::digest::DropRules,
 }
 
 /// Build the API router without binding a listener. Extracted so tests can
@@ -322,6 +324,7 @@ async fn metrics(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let body = json!({
         "events_accepted": snap.events_accepted,
         "events_rejected_rate_limit": snap.events_rejected_rate_limit,
+        "events_dropped_by_rule": snap.events_dropped_by_rule,
         "ws_lagged_total": snap.ws_lagged_total,
         "ingest_channel": {
             "capacity": state.events.max_capacity(),
@@ -1108,6 +1111,11 @@ async fn ingest_envelope(
     }
 
     for event in events {
+        // Answered 200 like a stored event, so an SDK does not retry it.
+        if state.drop_rules.drops(&event) {
+            state.metrics.inc_dropped_by_rule();
+            continue;
+        }
         let rec = crate::digest::IngestEvent {
             _budget: Some(budget.clone()),
             ..crate::digest::prepare(project.clone(), event)

@@ -124,6 +124,10 @@ async fn main() -> anyhow::Result<()> {
     init_tracing(&cfg.log_level);
     let client_ip = cfg.client_ip_policy().map_err(anyhow::Error::msg)?;
     let telegram_cfg = cfg.telegram().map_err(anyhow::Error::msg)?;
+    let drop_rules = cfg.drop_rules().map_err(anyhow::Error::msg)?;
+    if !drop_rules.is_empty() {
+        tracing::info!(rules = %cfg.drop_events, "ingest drops events by rule");
+    }
 
     // Storage: the file's parent must exist before SQLite will create it.
     tokio::fs::create_dir_all(&cfg.data_dir)
@@ -193,6 +197,7 @@ async fn main() -> anyhow::Result<()> {
         webhook_sender: webhook_tx.clone(),
         ingest_inflight: Arc::new(tokio::sync::Semaphore::new(INGEST_INFLIGHT)),
         ingest_budget: Arc::new(tokio::sync::Semaphore::new(ingest::INGEST_BUDGET_KIB)),
+        drop_rules,
     });
     // The WS fan-out is mounted on the HTTP listener via axum (see
     // crate::ws), so there's no separate task to spawn here.

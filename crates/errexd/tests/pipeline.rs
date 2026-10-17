@@ -74,6 +74,10 @@ struct Pipeline {
 }
 
 async fn pipeline() -> Pipeline {
+    pipeline_with(digest::DropRules::default()).await
+}
+
+async fn pipeline_with(drop_rules: digest::DropRules) -> Pipeline {
     let dir = unique_tempdir();
     let store = Store::open(&dir.join("errex.db")).await.unwrap();
     store.migrate().await.unwrap();
@@ -104,6 +108,7 @@ async fn pipeline() -> Pipeline {
         webhook_sender: webhook_tx,
         ingest_inflight: Arc::new(tokio::sync::Semaphore::new(8)),
         ingest_budget: Arc::new(tokio::sync::Semaphore::new(ingest::INGEST_BUDGET_KIB)),
+        drop_rules,
     });
     Pipeline {
         router: ingest::build_router(state),
@@ -271,4 +276,38 @@ async fn a_fatal_erased_flash_pages_on_every_event() {
             Some("com.zeusmotorsport.suite@1.2.3+45")
         );
     }
+}
+
+#[tokio::test]
+async fn a_drop_rule_answers_ok_and_stores_nothing() {
+    let mut p = pipeline_with(
+        digest::DropRules::parse("licensing_refused:api.status=401|403|404|409|410|429").unwrap(),
+    )
+    .await;
+    let refused = |status: &str| {
+        json!({
+            "level": "warning",
+            "fingerprint": ["licensing", "auth/login", "bad_credentials"],
+            "exception": { "values": [{ "type": "licensing_refused", "value": "refused" }] },
+            "tags": { "api.status": status, "api.code": "bad_credentials" }
+        })
+    };
+    // `ingest` asserts the 200 an SDK needs to stop retrying.
+    p.ingest(refused("401")).await;
+    p.ingest(refused("429")).await;
+    p.ingest(refused("503")).await;
+    let got = p.stored_event().await;
+    assert_eq!(got["payload"]["tags"]["api.status"], "503");
+    let issues = p.store.list_issues_by_project("suite-prod").await.unwrap();
+    assert_eq!(issues.len(), 1);
+    assert_eq!(
+        issues[0].event_count, 1,
+        "the dropped events were not stored"
+    );
+    let alert = p.alerts.recv().await.unwrap();
+    assert_eq!(alert.kind, webhook::TriggerKind::NewIssue);
+    assert!(
+        p.alerts.try_recv().is_err(),
+        "one alert, for the stored event"
+    );
 }

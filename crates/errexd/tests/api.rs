@@ -130,6 +130,7 @@ async fn fixture_full(
         webhook_sender: webhook_tx,
         ingest_inflight: Arc::new(tokio::sync::Semaphore::new(128)),
         ingest_budget: Arc::new(tokio::sync::Semaphore::new(ingest::INGEST_BUDGET_KIB)),
+        drop_rules: digest::DropRules::default(),
     });
     let router = ingest::build_router(state);
     tokio::spawn(async move {

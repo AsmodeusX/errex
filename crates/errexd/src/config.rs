@@ -3,7 +3,10 @@ use std::path::PathBuf;
 
 use clap::Parser;
 
+use errex_proto::Level;
+
 use crate::client_ip::{self, ClientIpPolicy};
+use crate::digest::DropRules;
 use crate::telegram::TelegramConfig;
 
 /// `host:port`, bracketing a bare IPv6 host (`::1` -> `[::1]:9090`).
@@ -183,6 +186,25 @@ pub struct Config {
     /// budget at Telegram's group limit.
     #[arg(long, env = "ERREX_TELEGRAM_MAX_PER_MIN", default_value_t = 10)]
     pub telegram_max_per_min: u32,
+
+    /// Lowest level of an issue that is alerted on Telegram: `debug`,
+    /// `info`, `warning`, `error` or `fatal`. An issue without a level
+    /// counts as `error` (Sentry's default). Pages are always alerted.
+    #[arg(long, env = "ERREX_TELEGRAM_MIN_LEVEL", default_value = "error")]
+    pub telegram_min_level: String,
+
+    /// Events dropped at ingest, answered 200 and never stored: rules
+    /// separated by `;`, each an exception type with optional tag
+    /// conditions, e.g. `licensing_refused:api.status=401|403;flash_ok`.
+    /// See `digest::DropRules`.
+    #[arg(long, env = "ERREX_DROP_EVENTS", default_value = "")]
+    pub drop_events: String,
+}
+
+/// A level by its Sentry name.
+pub fn parse_level(name: &str) -> Result<Level, String> {
+    serde_json::from_value(serde_json::Value::String(name.trim().to_ascii_lowercase()))
+        .map_err(|_| format!("`{name}` is not a level (debug, info, warning, error, fatal)"))
 }
 
 impl Config {
@@ -224,9 +246,15 @@ impl Config {
         }
     }
 
+    pub fn drop_rules(&self) -> Result<DropRules, String> {
+        DropRules::parse(&self.drop_events).map_err(|e| format!("ERREX_DROP_EVENTS: {e}"))
+    }
+
     /// Telegram settings, `None` when alerts are not configured. Half a
     /// configuration is an error rather than silence.
     pub fn telegram(&self) -> Result<Option<TelegramConfig>, String> {
+        let min_level = parse_level(&self.telegram_min_level)
+            .map_err(|e| format!("ERREX_TELEGRAM_MIN_LEVEL: {e}"))?;
         let token = match &self.telegram_bot_token_file {
             Some(path) => Some(
                 std::fs::read_to_string(path)
@@ -249,6 +277,7 @@ impl Config {
                 token,
                 chat_id: chat_id.to_string(),
                 max_per_min: self.telegram_max_per_min,
+                min_level,
             })),
             (Some(_), None) => {
                 Err("a Telegram bot token is set but ERREX_TELEGRAM_CHAT_ID is not".into())
@@ -400,6 +429,68 @@ mod tests {
         assert_eq!(tg.chat_id, "-1001234");
         assert_eq!(tg.api_base, "http://127.0.0.1:1");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn telegram_alerts_error_and_above_unless_told_otherwise() {
+        let tg = |extra: &[&str]| {
+            let mut args = vec![
+                "errexd",
+                "--telegram-bot-token",
+                "1:a",
+                "--telegram-chat-id",
+                "-1",
+            ];
+            args.extend_from_slice(extra);
+            Config::parse_from(args).telegram()
+        };
+        assert_eq!(tg(&[]).unwrap().unwrap().min_level, Level::Error);
+        assert_eq!(
+            tg(&["--telegram-min-level", "Warning"])
+                .unwrap()
+                .unwrap()
+                .min_level,
+            Level::Warning
+        );
+        assert!(tg(&["--telegram-min-level", "loud"]).is_err());
+    }
+
+    #[test]
+    fn drop_rules_default_to_none_and_refuse_a_bad_rule() {
+        assert!(Config::parse_from(["errexd"])
+            .drop_rules()
+            .unwrap()
+            .is_empty());
+        let cfg = Config::parse_from([
+            "errexd",
+            "--drop-events",
+            "licensing_refused:api.status=401|403;flash_ok",
+        ]);
+        assert!(!cfg.drop_rules().unwrap().is_empty());
+        let bad = Config::parse_from(["errexd", "--drop-events", "licensing_refused:api.status"]);
+        assert!(bad.drop_rules().is_err());
+    }
+
+    #[test]
+    fn the_wp_vps_drop_rules_parse_and_drop_a_wrong_password() {
+        let env = include_str!("../../../deploy/wp-vps/errexd.env.in");
+        let spec = env
+            .lines()
+            .find_map(|l| l.strip_prefix("ERREX_DROP_EVENTS="))
+            .expect("the template sets ERREX_DROP_EVENTS");
+        let rules = Config::parse_from(["errexd", "--drop-events", spec])
+            .drop_rules()
+            .unwrap();
+        let event = |status: &str| -> errex_proto::Event {
+            serde_json::from_value(serde_json::json!({
+                "level": "warning",
+                "exception": { "values": [{ "type": "licensing_refused" }] },
+                "tags": { "api.status": status, "api.code": "bad_credentials" },
+            }))
+            .unwrap()
+        };
+        assert!(rules.drops(&event("401")), "issue #3");
+        assert!(!rules.drops(&event("500")));
     }
 
     #[test]

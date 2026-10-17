@@ -29,6 +29,8 @@ self-host.
 | `ERREX_TELEGRAM_BOT_TOKEN` | _(unset)_ | Telegram bot token, when a file is not practical |
 | `ERREX_TELEGRAM_CHAT_ID` | _(unset)_ | Group or channel to alert (`-100…` or `@name`). Telegram alerts are on when this and a token are set. |
 | `ERREX_TELEGRAM_MAX_PER_MIN` | `10` | Telegram messages per minute for new issues and regressions; `0` = unlimited. Pages have their own budget. |
+| `ERREX_TELEGRAM_MIN_LEVEL` | `error` | Lowest issue level alerted on Telegram (`debug`, `info`, `warning`, `error`, `fatal`); an issue without a level counts as `error`. Pages are always alerted. |
+| `ERREX_DROP_EVENTS` | _(empty)_ | Events dropped at ingest, answered 200 and never stored. See [Drop rules](#drop-rules). |
 | `ERREX_PUBLIC_URL` | `http://localhost:9090` | **Set this for any non-localhost deployment.** Embedded in DSNs, webhook payloads, and the dashboard's curl example. The daemon warns at boot if you bound to a public interface but left this at the default. |
 | `ERREX_ADMIN_TOKEN` | _(unset)_ | Setup-wizard token; required to bootstrap the first admin user |
 
@@ -226,6 +228,28 @@ ERREX_TELEGRAM_CHAT_ID=-1001234567890
 ```
 
 A token without a chat id, or the reverse, stops the daemon at boot.
+
+Only issues at `ERREX_TELEGRAM_MIN_LEVEL` (default `error`) or above are
+alerted; an issue keeps the level of its first event, so a regression of a
+warning issue stays quiet too. Pages are alerted whatever their level.
+Webhooks are not filtered by level.
+
+## Drop rules
+
+`ERREX_DROP_EVENTS` lists events an operator never wants stored -- for
+example what app builds already in the field send for a user's own
+situation. Rules are separated by `;`. Each names an exception type
+(`exception.values[0].type`) and, optionally after `:`, comma-separated
+tag conditions that must all hold; a condition holds when the tag's value
+is one of the `|`-separated values, and a missing tag never holds:
+
+```bash
+ERREX_DROP_EVENTS='licensing_refused:api.status=401|403|404|409|410|429;flash_ok;flash_failed:flash.erased=false,flash.kind=adapter|timeout'
+```
+
+A dropped event is answered 200, so the SDK does not retry it, and counted
+in `/metrics` as `events_dropped_by_rule`. A malformed rule stops the daemon
+at boot.
 
 ## What ingest keeps
 

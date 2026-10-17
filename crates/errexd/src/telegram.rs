@@ -15,6 +15,7 @@
 
 use std::time::{Duration, Instant};
 
+use errex_proto::Level;
 use serde_json::{json, Value};
 use tokio::sync::mpsc;
 
@@ -27,6 +28,8 @@ pub struct TelegramConfig {
     pub token: String,
     pub chat_id: String,
     pub max_per_min: u32,
+    /// Lowest issue level alerted; pages are alerted whatever it is.
+    pub min_level: Level,
 }
 
 // The token must not reach a log line through `{:?}`.
@@ -37,6 +40,7 @@ impl std::fmt::Debug for TelegramConfig {
             .field("token", &"<redacted>")
             .field("chat_id", &self.chat_id)
             .field("max_per_min", &self.max_per_min)
+            .field("min_level", &self.min_level)
             .finish()
     }
 }
@@ -85,6 +89,32 @@ impl Budget {
             None
         }
     }
+}
+
+fn rank(level: Level) -> u8 {
+    match level {
+        Level::Debug => 0,
+        Level::Info => 1,
+        Level::Warning => 2,
+        Level::Error => 3,
+        Level::Fatal => 4,
+    }
+}
+
+/// Whether the trigger's issue is at `min` or above. A page always is; an
+/// issue without a level (or an unknown one) counts as `error`, Sentry's
+/// default.
+fn meets_level(t: &Trigger, min: Level) -> bool {
+    if t.kind == TriggerKind::Page {
+        return true;
+    }
+    let level = t
+        .issue
+        .level
+        .as_deref()
+        .and_then(|l| crate::config::parse_level(l).ok())
+        .unwrap_or(Level::Error);
+    rank(level) >= rank(min)
 }
 
 fn escape(s: &str) -> String {
@@ -142,7 +172,7 @@ pub async fn run(cfg: TelegramConfig, public_url: String, mut rx: mpsc::Receiver
     tracing::info!(chat_id = %cfg.chat_id, "telegram task started");
 
     while let Some(trigger) = rx.recv().await {
-        if !webhook::should_alert(&trigger) {
+        if !webhook::should_alert(&trigger) || !meets_level(&trigger, cfg.min_level) {
             continue;
         }
         let Some(held_back) = budget.admit(trigger.kind, Instant::now()) else {
@@ -258,8 +288,38 @@ mod tests {
             token: "123:SECRET".into(),
             chat_id: "-100".into(),
             max_per_min: 10,
+            min_level: Level::Error,
         };
         assert!(!format!("{cfg:?}").contains("SECRET"));
+    }
+
+    // ----- level -----
+
+    #[test]
+    fn only_issues_at_the_minimum_level_or_above_are_alerted() {
+        let at = |kind: TriggerKind, level: Option<&str>| {
+            let mut t = trigger(kind);
+            t.issue.level = level.map(str::to_string);
+            t
+        };
+        let new = TriggerKind::NewIssue;
+        assert!(meets_level(&at(new, Some("fatal")), Level::Error));
+        assert!(meets_level(&at(new, Some("error")), Level::Error));
+        assert!(!meets_level(&at(new, Some("warning")), Level::Error));
+        assert!(!meets_level(&at(new, Some("info")), Level::Error));
+        assert!(!meets_level(
+            &at(TriggerKind::Regression, Some("warning")),
+            Level::Error
+        ));
+        assert!(meets_level(&at(new, Some("warning")), Level::Warning));
+        assert!(
+            meets_level(&at(new, None), Level::Error),
+            "Sentry's default"
+        );
+        assert!(meets_level(
+            &at(TriggerKind::Page, Some("info")),
+            Level::Fatal
+        ));
     }
 
     // ----- budget -----
@@ -354,6 +414,7 @@ mod tests {
             token: "123:abc".into(),
             chat_id: "-1001234".into(),
             max_per_min,
+            min_level: Level::Error,
         }
     }
 
@@ -411,6 +472,26 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(100)).await;
         assert_eq!(seen.lock().unwrap().len(), 1);
         assert!(got[0].1["text"].as_str().unwrap().starts_with("<b>PAGE"));
+        drop(tx);
+        let _ = task.await;
+    }
+
+    #[tokio::test]
+    async fn a_warning_issue_is_not_alerted() {
+        let (base, seen) = mock(vec![200]).await;
+        let (tx, rx) = mpsc::channel(4);
+        let task = tokio::spawn(run(cfg(base, 10), "https://x".into(), rx));
+        let mut warning = trigger(TriggerKind::NewIssue);
+        warning.issue.level = Some("warning".into());
+        warning.issue.title = "licensing_refused".into();
+        tx.send(warning).await.unwrap();
+        let mut error = trigger(TriggerKind::NewIssue);
+        error.issue.level = Some("error".into());
+        tx.send(error).await.unwrap();
+        let got = wait_for(&seen, 1, Duration::from_secs(2)).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(seen.lock().unwrap().len(), 1);
+        assert!(got[0].1["text"].as_str().unwrap().contains("Level: error"));
         drop(tx);
         let _ = task.await;
     }

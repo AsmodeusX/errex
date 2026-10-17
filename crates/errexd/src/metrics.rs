@@ -16,6 +16,8 @@ pub struct Metrics {
     pub events_accepted: AtomicU64,
     /// Requests rejected because the per-project rate limiter denied them.
     pub events_rejected_rate_limit: AtomicU64,
+    /// Events dropped at ingest by an operator rule (`ERREX_DROP_EVENTS`).
+    pub events_dropped_by_rule: AtomicU64,
     /// Total `Lagged(skipped)` events observed by WS subscribers — when
     /// non-zero, the broadcast capacity is too small for the current load
     /// or a subscriber is too slow.
@@ -36,6 +38,10 @@ impl Metrics {
             .fetch_add(1, Ordering::Relaxed);
     }
 
+    pub fn inc_dropped_by_rule(&self) {
+        self.events_dropped_by_rule.fetch_add(1, Ordering::Relaxed);
+    }
+
     pub fn add_ws_lagged(&self, n: u64) {
         self.ws_lagged_total.fetch_add(n, Ordering::Relaxed);
     }
@@ -44,6 +50,7 @@ impl Metrics {
         Snapshot {
             events_accepted: self.events_accepted.load(Ordering::Relaxed),
             events_rejected_rate_limit: self.events_rejected_rate_limit.load(Ordering::Relaxed),
+            events_dropped_by_rule: self.events_dropped_by_rule.load(Ordering::Relaxed),
             ws_lagged_total: self.ws_lagged_total.load(Ordering::Relaxed),
         }
     }
@@ -53,6 +60,7 @@ impl Metrics {
 pub struct Snapshot {
     pub events_accepted: u64,
     pub events_rejected_rate_limit: u64,
+    pub events_dropped_by_rule: u64,
     pub ws_lagged_total: u64,
 }
 
@@ -79,10 +87,12 @@ mod tests {
         m.inc_accepted();
         m.inc_accepted();
         m.inc_rejected_rate_limit();
+        m.inc_dropped_by_rule();
         m.add_ws_lagged(3);
         let snap = m.snapshot();
         assert_eq!(snap.events_accepted, 2);
         assert_eq!(snap.events_rejected_rate_limit, 1);
+        assert_eq!(snap.events_dropped_by_rule, 1);
         assert_eq!(snap.ws_lagged_total, 3);
     }
 
