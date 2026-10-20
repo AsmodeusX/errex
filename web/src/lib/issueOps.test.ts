@@ -4,7 +4,7 @@
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { api } from './api';
-import { toggleIgnore, toggleMute, toggleResolve } from './issueOps';
+import { resolveIn, toggleIgnore, toggleMute, toggleResolve } from './issueOps';
 import { toast } from './toast.svelte';
 import type { Issue, IssueStatus } from './types';
 
@@ -55,6 +55,15 @@ describe('toggleResolve', () => {
     expect(spy).toHaveBeenCalledWith(7, 'unresolved');
   });
 
+  it('Undo of a reopen resolves in the release it was resolved in', async () => {
+    const spy = vi.spyOn(api, 'setStatus').mockResolvedValue(issue());
+    await toggleResolve(issue({ status: 'resolved', resolved_in_release: 'a@1.0.0+5' }));
+    expect(spy).toHaveBeenCalledWith(7, 'unresolved');
+    spy.mockClear();
+    toast.list[0]?.undo?.();
+    expect(spy).toHaveBeenCalledWith(7, 'resolved', 'a@1.0.0+5');
+  });
+
   it('shows an error toast if the API throws', async () => {
     vi.spyOn(api, 'setStatus').mockRejectedValueOnce(new Error('boom'));
     await expect(toggleResolve(issue())).rejects.toThrow();
@@ -84,6 +93,18 @@ describe('toggleIgnore', () => {
   it('ignored → unresolved', async () => {
     const spy = vi.spyOn(api, 'setStatus').mockResolvedValue(issue({ status: 'unresolved' }));
     await toggleIgnore(issue({ status: 'ignored' }));
+    expect(spy).toHaveBeenCalledWith(7, 'unresolved');
+  });
+});
+
+describe('resolveIn', () => {
+  it('resolves in the named release and Undo restores the previous status', async () => {
+    const spy = vi.spyOn(api, 'setStatus').mockResolvedValue(issue({ status: 'resolved' }));
+    await resolveIn(issue({ status: 'unresolved' }), 'a@1.0.0+5');
+    expect(spy).toHaveBeenCalledWith(7, 'resolved', 'a@1.0.0+5');
+    expect(toast.list[0]?.message).toBe('Resolved in a@1.0.0+5');
+    spy.mockClear();
+    toast.list[0]?.undo?.();
     expect(spy).toHaveBeenCalledWith(7, 'unresolved');
   });
 });

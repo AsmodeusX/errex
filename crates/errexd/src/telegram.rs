@@ -1,10 +1,11 @@
 //! Telegram alerts: one bot posting to one group or channel.
 //!
-//! Fed by the same triggers as the webhooks (new issue, regression) plus
-//! the paging rule (`digest::pages`), through its own channel and task so a
-//! slow webhook endpoint never delays a page.
+//! Fed by the same triggers as the webhooks (new issue, regression, an open
+//! issue's first event in a newer release) plus the paging rule
+//! (`digest::pages`), through its own channel and task so a slow webhook
+//! endpoint never delays a page.
 //!
-//! Rate limits: new issues and regressions share a per-minute budget
+//! Rate limits: ordinary alerts share a per-minute budget
 //! (`ERREX_TELEGRAM_MAX_PER_MIN`); what it holds back is counted and
 //! reported in the next message that goes out. Pages draw from a separate
 //! budget at Telegram's own group limit, so a storm of new issues cannot
@@ -129,7 +130,7 @@ pub fn format_message(t: &Trigger, public_url: &str, held_back: u32) -> String {
     let link = format!("{}/issues/{}", public_url.trim_end_matches('/'), issue.id);
     let mut text = format!(
         "<b>{}</b>\n{}\n\nProject: {}\nLevel: {}\nRelease: {}\nEvents: {}\n{}",
-        escape(t.kind.label()),
+        escape(&t.headline()),
         escape(&issue.title),
         escape(&issue.project),
         escape(issue.level.as_deref().unwrap_or("-")),
@@ -244,6 +245,10 @@ mod tests {
             event_count: 7,
             first_seen: Utc::now(),
             last_seen: Utc::now(),
+            first_release: None,
+            last_release: None,
+            newest_release: None,
+            resolved_in_release: None,
         }
     }
 
@@ -272,6 +277,14 @@ mod tests {
         assert!(text.contains("Events: 7"));
         assert!(text.contains("https://bt.example.com/issues/42"));
         assert!(!text.contains("held back"));
+    }
+
+    #[test]
+    fn regression_and_new_release_messages_name_the_release() {
+        let text = format_message(&trigger(TriggerKind::Regression), "https://x", 0);
+        assert!(text.starts_with("<b>Regressed in com.zeusmotorsport.suite@1.2.3+45</b>"));
+        let text = format_message(&trigger(TriggerKind::NewRelease), "https://x", 0);
+        assert!(text.starts_with("<b>Now also in com.zeusmotorsport.suite@1.2.3+45</b>"));
     }
 
     #[test]
@@ -311,6 +324,14 @@ mod tests {
             &at(TriggerKind::Regression, Some("warning")),
             Level::Error
         ));
+        assert!(!meets_level(
+            &at(TriggerKind::NewRelease, Some("warning")),
+            Level::Error
+        ));
+        assert!(meets_level(
+            &at(TriggerKind::NewRelease, Some("error")),
+            Level::Error
+        ));
         assert!(meets_level(&at(new, Some("warning")), Level::Warning));
         assert!(
             meets_level(&at(new, None), Level::Error),
@@ -330,7 +351,11 @@ mod tests {
         let mut b = Budget::new(2, t0);
         assert_eq!(b.admit(TriggerKind::NewIssue, t0), Some(0));
         assert_eq!(b.admit(TriggerKind::Regression, t0), Some(0));
-        assert_eq!(b.admit(TriggerKind::NewIssue, t0), None);
+        assert_eq!(
+            b.admit(TriggerKind::NewRelease, t0),
+            None,
+            "a new release shares the ordinary budget"
+        );
         assert_eq!(b.admit(TriggerKind::NewIssue, t0), None);
         // 30 s at 2/min refills one token; the next message reports two.
         let later = t0 + Duration::from_secs(30);

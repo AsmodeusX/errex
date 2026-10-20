@@ -25,6 +25,7 @@
   import { cn, relativeTime, shortFingerprint } from '$lib/utils';
   import Breadcrumbs from './Breadcrumbs.svelte';
   import EventData from './EventData.svelte';
+  import Releases from './Releases.svelte';
   import StackTrace from './StackTrace.svelte';
   import Tags from './Tags.svelte';
 
@@ -293,6 +294,8 @@
 
     <div class="flex-1 overflow-y-auto">
       <StackTrace exception={event?.exception ?? null} loading={eventLoading} />
+      <Separator />
+      <Releases {issue} />
       <Separator />
       <Breadcrumbs
         breadcrumbs={event?.breadcrumbs ?? []}

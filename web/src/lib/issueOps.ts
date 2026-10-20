@@ -24,16 +24,25 @@ interface ToggleOptions {
 async function setStatusWithToast(
   issue: Issue,
   next: IssueStatus,
-  primary: string
+  primary: string,
+  release?: string
 ): Promise<void> {
   const prev = issue.status;
   try {
-    await api.setStatus(issue.id, next);
+    await (release === undefined
+      ? api.setStatus(issue.id, next)
+      : api.setStatus(issue.id, next, release));
     toast.success(primary, {
       description: issue.title,
       undo: () => {
-        // Fire-and-forget; if the rollback itself fails we surface a 2nd toast.
-        api.setStatus(issue.id, prev).catch((err) => {
+        // Undoing a reopen resolves in the release it was resolved in, not
+        // the newest one. Fire-and-forget; if the rollback itself fails we
+        // surface a 2nd toast.
+        const restore =
+          prev === 'resolved' && issue.resolved_in_release
+            ? api.setStatus(issue.id, prev, issue.resolved_in_release)
+            : api.setStatus(issue.id, prev);
+        restore.catch((err) => {
           console.warn('undo failed', err);
           toast.error('Could not undo', { description: String(err) });
         });
@@ -51,6 +60,12 @@ export function toggleResolve(issue: Issue, opts: Partial<ToggleOptions> = {}): 
     return setStatusWithToast(issue, 'unresolved', opts.inverse ?? 'Issue reopened');
   }
   return setStatusWithToast(issue, 'resolved', opts.primary ?? 'Issue resolved');
+}
+
+/** Resolve in a named release: events from it or an older one only count;
+ *  a newer one regresses the issue. */
+export function resolveIn(issue: Issue, release: string): Promise<void> {
+  return setStatusWithToast(issue, 'resolved', `Resolved in ${release}`, release);
 }
 
 /** Mute ↔ Unresolved (`m`). */

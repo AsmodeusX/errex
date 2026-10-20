@@ -28,6 +28,29 @@ export interface Issue {
   user_count?: number;
   /** Set by the daemon when an issue re-fired after being resolved. */
   regressed?: boolean;
+  /** Release of the first event that carried one. */
+  first_release?: string | null;
+  /** Release of the most recent event that carried one. */
+  last_release?: string | null;
+  /** Newest release, in the daemon's release order, that reported the issue. */
+  newest_release?: string | null;
+  /** While resolved: events from this release or older count without
+   *  regressing the issue. */
+  resolved_in_release?: string | null;
+}
+
+/** One release that reported an issue (`GET /api/issues/:id/releases`). */
+export interface IssueRelease {
+  release: string;
+  event_count: number;
+  first_seen: string;
+  last_seen: string;
+}
+
+/** One release a project has reported (`GET /api/projects/:name/releases`). */
+export interface ProjectRelease {
+  release: string;
+  first_seen: string;
 }
 
 export interface ProjectSummary {

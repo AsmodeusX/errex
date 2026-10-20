@@ -2489,3 +2489,150 @@ async fn ingest_accepts_gzip_envelope_that_expands_past_budget_share() {
     .unwrap();
     assert_eq!(res.status(), StatusCode::OK);
 }
+
+// ----- releases -----
+
+/// An issue in project `p` with one event from each release, in order.
+async fn issue_seen_in(store: &Store, releases: &[&str]) -> i64 {
+    let f = Fingerprint::new("rel");
+    let mut id = 0;
+    for (i, release) in releases.iter().enumerate() {
+        let event_id = format!("{i:032x}");
+        let r = store
+            .upsert_batch_with_events(&[store::BatchUpsertInput {
+                project: "p",
+                fp: &f,
+                title: "T",
+                culprit: None,
+                level: Some("error"),
+                now: Utc::now() + chrono::Duration::seconds(i as i64),
+                event_id: &event_id,
+                payload: "{}",
+                release: Some(release),
+            }])
+            .await
+            .unwrap();
+        id = r[0].issue.id;
+    }
+    id
+}
+
+async fn send(
+    router: axum::Router,
+    method: &str,
+    uri: &str,
+    cookie: Option<&str>,
+    body: Option<&str>,
+) -> axum::response::Response {
+    let mut req = Request::builder().method(method).uri(uri);
+    if let Some(cookie) = cookie {
+        req = req.header("cookie", cookie);
+    }
+    if body.is_some() {
+        req = req.header("content-type", "application/json");
+    }
+    let body = body.map_or_else(Body::empty, |b| Body::from(b.to_string()));
+    router.oneshot(req.body(body).unwrap()).await.unwrap()
+}
+
+#[tokio::test]
+async fn put_status_resolves_in_the_newest_release_or_the_one_named() {
+    let (router, store, _dir) = fixture().await;
+    let cookie = admin_cookie(&store).await;
+    let id = issue_seen_in(&store, &["app@1.0.0+1", "app@1.0.1+2"]).await;
+    let uri = format!("/api/issues/{id}/status");
+
+    let res = send(
+        router.clone(),
+        "PUT",
+        &uri,
+        Some(&cookie),
+        Some(r#"{"status":"resolved"}"#),
+    )
+    .await;
+    assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(body_json(res).await["resolved_in_release"], "app@1.0.1+2");
+
+    let res = send(
+        router.clone(),
+        "PUT",
+        &uri,
+        Some(&cookie),
+        Some(r#"{"status":"resolved","release":"app@1.0.0+1"}"#),
+    )
+    .await;
+    assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(body_json(res).await["resolved_in_release"], "app@1.0.0+1");
+
+    let res = send(
+        router.clone(),
+        "PUT",
+        &uri,
+        Some(&cookie),
+        Some(r#"{"status":"resolved","release":"app@9.9.9+99"}"#),
+    )
+    .await;
+    assert_eq!(res.status(), StatusCode::BAD_REQUEST, "never reported");
+
+    let res = send(
+        router,
+        "PUT",
+        &uri,
+        Some(&cookie),
+        Some(r#"{"status":"unresolved"}"#),
+    )
+    .await;
+    assert_eq!(res.status(), StatusCode::OK);
+    assert!(body_json(res).await["resolved_in_release"].is_null());
+}
+
+#[tokio::test]
+async fn release_lists_are_newest_first_and_need_a_session() {
+    let (router, store, _dir) = fixture().await;
+    let id = issue_seen_in(&store, &["app@1.0.1+2", "app@1.0.0+1", "app@1.0.1+2"]).await;
+    let issue_uri = format!("/api/issues/{id}/releases");
+
+    for uri in [issue_uri.as_str(), "/api/projects/p/releases"] {
+        let res = send(router.clone(), "GET", uri, None, None).await;
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED, "{uri}");
+    }
+
+    store
+        .create_user("v", "hash", store::Role::Viewer)
+        .await
+        .unwrap();
+    store.create_session("s-v", "v", None, None).await.unwrap();
+    let cookie = "errex_session=s-v";
+
+    let res = send(router.clone(), "GET", &issue_uri, Some(cookie), None).await;
+    assert_eq!(res.status(), StatusCode::OK);
+    let v = body_json(res).await;
+    assert_eq!(v[0]["release"], "app@1.0.1+2");
+    assert_eq!(v[0]["event_count"], 2);
+    assert_eq!(v[1]["release"], "app@1.0.0+1");
+    assert_eq!(v[1]["event_count"], 1);
+    assert!(v[0]["first_seen"].is_string() && v[0]["last_seen"].is_string());
+
+    let res = send(
+        router.clone(),
+        "GET",
+        "/api/projects/p/releases",
+        Some(cookie),
+        None,
+    )
+    .await;
+    assert_eq!(res.status(), StatusCode::OK);
+    let v = body_json(res).await;
+    assert_eq!(v.as_array().unwrap().len(), 2);
+    assert_eq!(v[0]["release"], "app@1.0.1+2");
+
+    let res = send(
+        router,
+        "GET",
+        "/api/issues/999999/releases",
+        Some(cookie),
+        None,
+    )
+    .await;
+    assert_eq!(res.status(), StatusCode::NOT_FOUND);
+}

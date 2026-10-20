@@ -311,3 +311,86 @@ async fn a_drop_rule_answers_ok_and_stores_nothing() {
         "one alert, for the stored event"
     );
 }
+
+impl Pipeline {
+    /// Waits until the only issue has `n` events stored.
+    async fn wait_for_events(&self, n: i64) -> errex_proto::Issue {
+        for _ in 0..200 {
+            let issues = self
+                .store
+                .list_issues_by_project("suite-prod")
+                .await
+                .unwrap();
+            if let Some(issue) = issues.first().filter(|i| i.event_count == n) {
+                return issue.clone();
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("issue never reached {n} events");
+    }
+
+    async fn next_alert(&mut self) -> webhook::Trigger {
+        tokio::time::timeout(std::time::Duration::from_secs(2), self.alerts.recv())
+            .await
+            .expect("alert fired")
+            .unwrap()
+    }
+}
+
+#[tokio::test]
+async fn alerts_fire_once_per_issue_per_release() {
+    let mut p = pipeline().await;
+    let defect = |build: u32| {
+        json!({
+            "level": "error",
+            "release": format!("zeus-suite@0.0.{build}+{build}"),
+            "fingerprint": ["unhandled", "StateError", "flash_page"],
+            "exception": { "values": [{ "type": "StateError", "value": "bad state" }] }
+        })
+    };
+    let headline = |t: &webhook::Trigger| t.headline();
+
+    p.ingest(defect(12)).await;
+    let t = p.next_alert().await;
+    assert_eq!(t.kind, webhook::TriggerKind::NewIssue);
+
+    p.ingest(defect(12)).await;
+    p.wait_for_events(2).await;
+    assert!(p.alerts.try_recv().is_err(), "a repeat in the same release");
+
+    p.ingest(defect(13)).await;
+    let t = p.next_alert().await;
+    assert_eq!(t.kind, webhook::TriggerKind::NewRelease);
+    assert_eq!(headline(&t), "Now also in zeus-suite@0.0.13+13");
+
+    p.ingest(defect(13)).await;
+    p.ingest(defect(12)).await;
+    let issue = p.wait_for_events(5).await;
+    assert!(p.alerts.try_recv().is_err(), "releases already seen");
+
+    // Resolved in the newest release; build 13 is still in the field.
+    let resolved = p
+        .store
+        .set_status(issue.id, errex_proto::IssueStatus::Resolved, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        resolved.resolved_in_release.as_deref(),
+        Some("zeus-suite@0.0.13+13")
+    );
+    p.ingest(defect(13)).await;
+    p.ingest(defect(11)).await;
+    let issue = p.wait_for_events(7).await;
+    assert_eq!(issue.status, errex_proto::IssueStatus::Resolved);
+    assert!(p.alerts.try_recv().is_err(), "old builds only count");
+
+    p.ingest(defect(14)).await;
+    let t = p.next_alert().await;
+    assert_eq!(t.kind, webhook::TriggerKind::Regression);
+    assert_eq!(headline(&t), "Regressed in zeus-suite@0.0.14+14");
+    assert_eq!(t.issue.status, errex_proto::IssueStatus::Unresolved);
+
+    p.ingest(defect(14)).await;
+    p.wait_for_events(9).await;
+    assert!(p.alerts.try_recv().is_err(), "regressed once");
+}

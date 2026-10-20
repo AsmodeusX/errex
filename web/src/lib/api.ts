@@ -1,4 +1,11 @@
-import type { Issue, IssueStatus, ProjectSummary, StoredEvent } from './types';
+import type {
+  Issue,
+  IssueRelease,
+  IssueStatus,
+  ProjectRelease,
+  ProjectSummary,
+  StoredEvent
+} from './types';
 
 // Same-origin in production (SPA is served by the daemon). In dev, Vite proxies
 // /api to the daemon on :9090, so this base stays empty either way.
@@ -193,8 +200,19 @@ export const api = {
   /** Server-authoritative status mutation. WS will broadcast `IssueUpdated`
    *  to all connected clients including this one — the returned Issue is
    *  authoritative for optimistic-UI rollback if the caller cares. */
-  setStatus: (id: number, status: IssueStatus) =>
-    send<Issue>('PUT', `/api/issues/${id}/status`, { status }),
+  setStatus: (id: number, status: IssueStatus, release?: string) =>
+    send<Issue>(
+      'PUT',
+      `/api/issues/${id}/status`,
+      release === undefined ? { status } : { status, release }
+    ),
+
+  /** Releases that reported an issue, newest first. */
+  issueReleases: (id: number) => get<IssueRelease[] | null>(`/api/issues/${id}/releases`),
+
+  /** Every release a project has reported, newest first. */
+  projectReleases: (project: string) =>
+    get<ProjectRelease[]>(`/api/projects/${encodeURIComponent(project)}/releases`),
 
   auth: {
     setupStatus: () => authedGet<SetupStatus>('/api/auth/setup-status'),

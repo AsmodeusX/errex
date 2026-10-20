@@ -4,7 +4,7 @@ use chrono::{DateTime, Utc};
 use errex_proto::{Event, Fingerprint, Issue, IssueStatus};
 use serde::{Deserialize, Serialize};
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous};
-use sqlx::SqlitePool;
+use sqlx::{SqliteConnection, SqlitePool};
 
 /// Upper bound on issues returned by one list or snapshot query.
 const ISSUE_LIST_LIMIT: i64 = 1000;
@@ -173,18 +173,49 @@ pub struct BatchUpsertInput<'a> {
     pub now: DateTime<Utc>,
     pub event_id: &'a str,
     pub payload: &'a str,
+    /// The event's release, already capped by `digest::prepare`.
+    pub release: Option<&'a str>,
 }
 
 /// Result of an upsert: the full `Issue` row as it stands after the write.
 /// `created` is true when this was the first event with that fingerprint —
 /// callers use it to choose `IssueCreated` vs `IssueUpdated` on the wire.
 /// `regressed` is true when the upsert flipped a `resolved` issue back to
-/// `unresolved` (a fresh event for something we thought was fixed).
+/// `unresolved` (an event from a release newer than the one it was resolved
+/// in). `new_release` is true for an open issue's first event from a
+/// release newer than every release that reported it before.
 #[derive(Debug, Clone)]
 pub struct UpsertResult {
     pub issue: Issue,
     pub created: bool,
     pub regressed: bool,
+    pub new_release: bool,
+}
+
+/// One release that reported an issue, as `/api/issues/:id/releases`
+/// returns it.
+#[derive(Debug, Clone, Serialize)]
+pub struct IssueRelease {
+    pub release: String,
+    pub event_count: i64,
+    pub first_seen: DateTime<Utc>,
+    pub last_seen: DateTime<Utc>,
+}
+
+/// One release a project has reported, as `/api/projects/:name/releases`
+/// returns it.
+#[derive(Debug, Clone, Serialize)]
+pub struct ProjectRelease {
+    pub release: String,
+    pub first_seen: DateTime<Utc>,
+}
+
+/// The `issues` columns `IssueRow` reads, for `concat!` into a query.
+macro_rules! issue_columns {
+    () => {
+        "id, project, fingerprint, title, culprit, level, status, event_count, first_seen, \
+         last_seen, first_release, last_release, newest_release, resolved_in_release"
+    };
 }
 
 /// A persisted event with its raw payload kept verbatim. The renderer can
@@ -260,6 +291,56 @@ impl Store {
 
     pub async fn migrate(&self) -> Result<(), DaemonError> {
         sqlx::migrate!("./migrations").run(&self.pool).await?;
+        self.backfill_release_order().await?;
+        Ok(())
+    }
+
+    /// Completes the releases migration's back-fill with what needs release
+    /// order: each issue's `newest_release`, and for an issue that was
+    /// already resolved, `resolved_in_release` set to that newest release.
+    /// Resolving in the newest release that reported the issue is the
+    /// cautious choice: an event from any release after it regresses.
+    ///
+    /// Live ingest sets `newest_release` whenever an issue gains a release,
+    /// so only back-filled issues match and every later start is one empty
+    /// query.
+    async fn backfill_release_order(&self) -> Result<(), DaemonError> {
+        let mut tx = self.pool.begin().await?;
+        let issues: Vec<(i64, String)> = sqlx::query_as(
+            "SELECT i.id, i.project FROM issues i WHERE i.newest_release IS NULL \
+             AND EXISTS (SELECT 1 FROM issue_releases ir WHERE ir.issue_id = i.id)",
+        )
+        .fetch_all(&mut *tx)
+        .await?;
+        for (issue_id, project) in &issues {
+            let releases: Vec<(String, Option<String>)> = sqlx::query_as(
+                "SELECT ir.release, r.first_seen FROM issue_releases ir \
+                 LEFT JOIN releases r ON r.project = ? AND r.release = ir.release \
+                 WHERE ir.issue_id = ?",
+            )
+            .bind(project)
+            .bind(issue_id)
+            .fetch_all(&mut *tx)
+            .await?;
+            let newest = releases
+                .iter()
+                .max_by(|a, b| release_order(&a.0, a.1.as_deref(), &b.0, b.1.as_deref()))
+                .map(|r| r.0.as_str());
+            sqlx::query(
+                "UPDATE issues SET newest_release = ?, resolved_in_release = \
+                 CASE WHEN status = 'resolved' AND resolved_in_release IS NULL THEN ? \
+                 ELSE resolved_in_release END WHERE id = ?",
+            )
+            .bind(newest)
+            .bind(newest)
+            .bind(issue_id)
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
+        if !issues.is_empty() {
+            tracing::info!(issues = issues.len(), "back-filled release order");
+        }
         Ok(())
     }
 
@@ -347,7 +428,8 @@ impl Store {
         // updated event_count without a second roundtrip.
         let row: IssueRow = sqlx::query_as(
             "SELECT id, project, fingerprint, title, culprit, level, status, \
-             event_count, first_seen, last_seen \
+             event_count, first_seen, last_seen, \
+             first_release, last_release, newest_release, resolved_in_release \
              FROM issues WHERE project = ? AND fingerprint = ?",
         )
         .bind(project)
@@ -360,6 +442,7 @@ impl Store {
             issue: row.into(),
             created,
             regressed,
+            new_release: false,
         })
     }
 
@@ -399,7 +482,8 @@ impl Store {
             if let Some(issue_id) = replayed_issue {
                 let row: IssueRow = sqlx::query_as(
                     "SELECT id, project, fingerprint, title, culprit, level, status, \
-                     event_count, first_seen, last_seen \
+                     event_count, first_seen, last_seen, \
+                     first_release, last_release, newest_release, resolved_in_release \
                      FROM issues WHERE id = ?",
                 )
                 .bind(issue_id)
@@ -409,6 +493,7 @@ impl Store {
                     issue: row.into(),
                     created: false,
                     regressed: false,
+                    new_release: false,
                 });
                 continue;
             }
@@ -431,11 +516,11 @@ impl Store {
             .rows_affected();
 
             let created = inserted == 1;
-            let mut regressed = false;
 
             let row: IssueRow = sqlx::query_as(
                 "SELECT id, project, fingerprint, title, culprit, level, status, \
-                 event_count, first_seen, last_seen \
+                 event_count, first_seen, last_seen, \
+                 first_release, last_release, newest_release, resolved_in_release \
                  FROM issues WHERE project = ? AND fingerprint = ?",
             )
             .bind(input.project)
@@ -459,34 +544,110 @@ impl Store {
             .rows_affected()
                 == 1;
 
-            let row = if !created && event_inserted {
-                let previously_resolved =
-                    IssueStatus::from_db_str(&row.status) == IssueStatus::Resolved;
-                regressed = previously_resolved;
-                let sql = if previously_resolved {
-                    "UPDATE issues SET event_count = event_count + 1, last_seen = ?, \
-                     status = 'unresolved' WHERE id = ? \
-                     RETURNING id, project, fingerprint, title, culprit, level, status, \
-                     event_count, first_seen, last_seen"
-                } else {
-                    "UPDATE issues SET event_count = event_count + 1, last_seen = ? \
-                     WHERE id = ? \
-                     RETURNING id, project, fingerprint, title, culprit, level, status, \
-                     event_count, first_seen, last_seen"
+            let release = input.release.filter(|r| !r.is_empty());
+            if created {
+                let row = match release {
+                    Some(release) => {
+                        note_release(&mut tx, input.project, release, now).await?;
+                        count_issue_release(&mut tx, row.id, release, now).await?;
+                        sqlx::query_as(concat!(
+                            "UPDATE issues SET first_release = ?, last_release = ?, \
+                             newest_release = ? WHERE id = ? RETURNING ",
+                            issue_columns!()
+                        ))
+                        .bind(release)
+                        .bind(release)
+                        .bind(release)
+                        .bind(row.id)
+                        .fetch_one(&mut *tx)
+                        .await?
+                    }
+                    None => row,
                 };
-                sqlx::query_as(sql)
-                    .bind(now)
-                    .bind(row.id)
-                    .fetch_one(&mut *tx)
-                    .await?
-            } else {
-                row
+                results.push(UpsertResult {
+                    issue: row.into(),
+                    created: true,
+                    regressed: false,
+                    new_release: false,
+                });
+                continue;
+            }
+            if !event_inserted {
+                results.push(UpsertResult {
+                    issue: row.into(),
+                    created: false,
+                    regressed: false,
+                    new_release: false,
+                });
+                continue;
+            }
+
+            let first_in_release = match release {
+                Some(release) => {
+                    note_release(&mut tx, &row.project, release, now).await?;
+                    count_issue_release(&mut tx, row.id, release, now).await?
+                }
+                None => false,
             };
+            let status = IssueStatus::from_db_str(&row.status);
+            // A resolved issue regresses on an event from a release newer
+            // than the one it was resolved in. Old builds still in the field
+            // keep reporting a fixed defect; their events only count. Without
+            // a release on either side there is nothing to compare, and the
+            // event regresses the issue as it always did.
+            let regressed = status == IssueStatus::Resolved
+                && match (release, row.resolved_in_release.as_deref()) {
+                    (Some(release), Some(fixed)) => {
+                        is_newer(&mut tx, &row.project, release, fixed).await?
+                    }
+                    _ => true,
+                };
+            let beyond_newest = match (release, row.newest_release.as_deref()) {
+                (Some(release), Some(newest)) => {
+                    is_newer(&mut tx, &row.project, release, newest).await?
+                }
+                (Some(_), None) => true,
+                (None, _) => false,
+            };
+            // An open issue's first event from a release newer than every
+            // release that reported it before. An issue with no release
+            // history has nothing to be newer than, so it stays quiet: that
+            // keeps issues whose events retention purged from alerting.
+            let new_release = first_in_release
+                && beyond_newest
+                && row.newest_release.is_some()
+                && status != IssueStatus::Resolved;
+            let newest = if beyond_newest {
+                release
+            } else {
+                row.newest_release.as_deref()
+            };
+            let (status, resolved_in) = if regressed {
+                (IssueStatus::Unresolved, None)
+            } else {
+                (status, row.resolved_in_release.as_deref())
+            };
+            let updated: IssueRow = sqlx::query_as(concat!(
+                "UPDATE issues SET event_count = event_count + 1, last_seen = ?, \
+                 first_release = ?, last_release = ?, newest_release = ?, \
+                 status = ?, resolved_in_release = ? WHERE id = ? RETURNING ",
+                issue_columns!()
+            ))
+            .bind(now)
+            .bind(row.first_release.as_deref().or(release))
+            .bind(release.or(row.last_release.as_deref()))
+            .bind(newest)
+            .bind(status.as_db_str())
+            .bind(resolved_in)
+            .bind(row.id)
+            .fetch_one(&mut *tx)
+            .await?;
 
             results.push(UpsertResult {
-                issue: row.into(),
-                created,
+                issue: updated.into(),
+                created: false,
                 regressed,
+                new_release,
             });
         }
 
@@ -497,30 +658,104 @@ impl Store {
     /// Set the triage status for an issue, returning the updated row.
     /// Errors when the issue does not exist (callers should validate the
     /// id from the URL before calling).
+    ///
+    /// Resolving records the release it is resolved in: `release` when
+    /// given, which must be one the issue's project has reported
+    /// (`DaemonError::Invalid` otherwise), else the project's newest
+    /// release, else none. Any other status clears it.
     pub async fn set_status(
         &self,
         issue_id: i64,
         status: IssueStatus,
+        release: Option<&str>,
     ) -> Result<Issue, DaemonError> {
         let mut tx = self.pool.begin().await?;
-        let updated = sqlx::query("UPDATE issues SET status = ? WHERE id = ?")
-            .bind(status.as_db_str())
+        let project: Option<String> = sqlx::query_scalar("SELECT project FROM issues WHERE id = ?")
             .bind(issue_id)
-            .execute(&mut *tx)
-            .await?
-            .rows_affected();
-        if updated == 0 {
+            .fetch_optional(&mut *tx)
+            .await?;
+        let Some(project) = project else {
             return Err(DaemonError::NotFound(format!("issue {issue_id}")));
-        }
-        let row: IssueRow = sqlx::query_as(
-            "SELECT id, project, fingerprint, title, culprit, level, status, \
-             event_count, first_seen, last_seen FROM issues WHERE id = ?",
-        )
+        };
+        let resolved_in = match (status, release) {
+            (IssueStatus::Resolved, Some(release)) => {
+                if release_first_seen(&mut tx, &project, release)
+                    .await?
+                    .is_none()
+                {
+                    return Err(DaemonError::Invalid(format!(
+                        "release {release} has not reported anything in project {project}"
+                    )));
+                }
+                Some(release.to_string())
+            }
+            (IssueStatus::Resolved, None) => newest_project_release(&mut tx, &project).await?,
+            _ => None,
+        };
+        let row: IssueRow = sqlx::query_as(concat!(
+            "UPDATE issues SET status = ?, resolved_in_release = ? WHERE id = ? RETURNING ",
+            issue_columns!()
+        ))
+        .bind(status.as_db_str())
+        .bind(resolved_in)
         .bind(issue_id)
         .fetch_one(&mut *tx)
         .await?;
         tx.commit().await?;
         Ok(row.into())
+    }
+
+    /// The releases that reported an issue, newest first in release order.
+    /// Errors when the issue does not exist.
+    pub async fn issue_releases(&self, issue_id: i64) -> Result<Vec<IssueRelease>, DaemonError> {
+        let mut conn = self.pool.acquire().await?;
+        let project: Option<String> = sqlx::query_scalar("SELECT project FROM issues WHERE id = ?")
+            .bind(issue_id)
+            .fetch_optional(&mut *conn)
+            .await?;
+        if project.is_none() {
+            return Err(DaemonError::NotFound(format!("issue {issue_id}")));
+        }
+        let mut rows: Vec<(String, i64, String, String, Option<String>)> = sqlx::query_as(
+            "SELECT ir.release, ir.event_count, ir.first_seen, ir.last_seen, r.first_seen \
+             FROM issue_releases ir \
+             JOIN issues i ON i.id = ir.issue_id \
+             LEFT JOIN releases r ON r.project = i.project AND r.release = ir.release \
+             WHERE ir.issue_id = ? ORDER BY ir.last_seen DESC LIMIT ?",
+        )
+        .bind(issue_id)
+        .bind(ISSUE_LIST_LIMIT)
+        .fetch_all(&mut *conn)
+        .await?;
+        rows.sort_by(|a, b| release_order(&b.0, b.4.as_deref(), &a.0, a.4.as_deref()));
+        Ok(rows
+            .into_iter()
+            .map(
+                |(release, event_count, first_seen, last_seen, _)| IssueRelease {
+                    release,
+                    event_count,
+                    first_seen: parse_or_now(&first_seen),
+                    last_seen: parse_or_now(&last_seen),
+                },
+            )
+            .collect())
+    }
+
+    /// Every release a project has reported, newest first in release order.
+    pub async fn project_releases(
+        &self,
+        project: &str,
+    ) -> Result<Vec<ProjectRelease>, DaemonError> {
+        let mut conn = self.pool.acquire().await?;
+        let mut rows = project_release_rows(&mut conn, project).await?;
+        rows.sort_by(|a, b| release_order(&b.0, Some(&b.1), &a.0, Some(&a.1)));
+        Ok(rows
+            .into_iter()
+            .map(|(release, first_seen)| ProjectRelease {
+                release,
+                first_seen: parse_or_now(&first_seen),
+            })
+            .collect())
     }
 
     /// Append the raw event payload for an issue. `event_id` is the SDK-side
@@ -550,7 +785,8 @@ impl Store {
     pub async fn load_issues(&self) -> Result<Vec<Issue>, DaemonError> {
         let rows: Vec<IssueRow> = sqlx::query_as(
             "SELECT id, project, fingerprint, title, culprit, level, status, \
-             event_count, first_seen, last_seen \
+             event_count, first_seen, last_seen, \
+             first_release, last_release, newest_release, resolved_in_release \
              FROM issues ORDER BY last_seen DESC LIMIT ?",
         )
         .bind(ISSUE_LIST_LIMIT)
@@ -563,7 +799,8 @@ impl Store {
     pub async fn list_issues_by_project(&self, project: &str) -> Result<Vec<Issue>, DaemonError> {
         let rows: Vec<IssueRow> = sqlx::query_as(
             "SELECT id, project, fingerprint, title, culprit, level, status, \
-             event_count, first_seen, last_seen \
+             event_count, first_seen, last_seen, \
+             first_release, last_release, newest_release, resolved_in_release \
              FROM issues WHERE project = ? ORDER BY last_seen DESC LIMIT ?",
         )
         .bind(project)
@@ -893,6 +1130,10 @@ impl Store {
             .bind(name)
             .execute(&mut *tx)
             .await?;
+        sqlx::query("DELETE FROM releases WHERE project = ?")
+            .bind(name)
+            .execute(&mut *tx)
+            .await?;
         sqlx::query("DELETE FROM projects WHERE name = ?")
             .bind(name)
             .execute(&mut *tx)
@@ -948,6 +1189,11 @@ impl Store {
             .execute(&mut *tx)
             .await?;
         sqlx::query("UPDATE issues SET project = ? WHERE project = ?")
+            .bind(new)
+            .bind(old)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("UPDATE releases SET project = ? WHERE project = ?")
             .bind(new)
             .bind(old)
             .execute(&mut *tx)
@@ -1482,6 +1728,119 @@ impl Store {
     }
 }
 
+/// Release order inside one project. The strings decide where they can
+/// (`errex_proto::release::compare`); otherwise the release that first
+/// reported anything earlier is the older one, and a release the project
+/// has no record of sorts below every recorded one. Equal times fall back
+/// to the strings so the order is total.
+pub fn release_order(
+    a: &str,
+    a_first_seen: Option<&str>,
+    b: &str,
+    b_first_seen: Option<&str>,
+) -> std::cmp::Ordering {
+    let seen = |s: Option<&str>| s.and_then(|s| DateTime::parse_from_rfc3339(s).ok());
+    errex_proto::release::compare(a, b).unwrap_or_else(|| {
+        seen(a_first_seen)
+            .cmp(&seen(b_first_seen))
+            .then_with(|| a.cmp(b))
+    })
+}
+
+async fn release_first_seen(
+    conn: &mut SqliteConnection,
+    project: &str,
+    release: &str,
+) -> Result<Option<String>, DaemonError> {
+    Ok(
+        sqlx::query_scalar("SELECT first_seen FROM releases WHERE project = ? AND release = ?")
+            .bind(project)
+            .bind(release)
+            .fetch_optional(&mut *conn)
+            .await?,
+    )
+}
+
+/// Whether release `a` is newer than release `b` in `project`.
+async fn is_newer(
+    conn: &mut SqliteConnection,
+    project: &str,
+    a: &str,
+    b: &str,
+) -> Result<bool, DaemonError> {
+    if let Some(ord) = errex_proto::release::compare(a, b) {
+        return Ok(ord == std::cmp::Ordering::Greater);
+    }
+    let a_seen = release_first_seen(conn, project, a).await?;
+    let b_seen = release_first_seen(conn, project, b).await?;
+    Ok(release_order(a, a_seen.as_deref(), b, b_seen.as_deref()) == std::cmp::Ordering::Greater)
+}
+
+async fn project_release_rows(
+    conn: &mut SqliteConnection,
+    project: &str,
+) -> Result<Vec<(String, String)>, DaemonError> {
+    Ok(
+        sqlx::query_as("SELECT release, first_seen FROM releases WHERE project = ?")
+            .bind(project)
+            .fetch_all(&mut *conn)
+            .await?,
+    )
+}
+
+async fn newest_project_release(
+    conn: &mut SqliteConnection,
+    project: &str,
+) -> Result<Option<String>, DaemonError> {
+    Ok(project_release_rows(conn, project)
+        .await?
+        .into_iter()
+        .max_by(|a, b| release_order(&a.0, Some(&a.1), &b.0, Some(&b.1)))
+        .map(|(release, _)| release))
+}
+
+/// Records that `release` has reported something in `project`.
+async fn note_release(
+    conn: &mut SqliteConnection,
+    project: &str,
+    release: &str,
+    now: DateTime<Utc>,
+) -> Result<(), DaemonError> {
+    sqlx::query("INSERT OR IGNORE INTO releases (project, release, first_seen) VALUES (?, ?, ?)")
+        .bind(project)
+        .bind(release)
+        .bind(now)
+        .execute(&mut *conn)
+        .await?;
+    Ok(())
+}
+
+/// Counts one event from `release` against the issue. True when it is the
+/// issue's first event from that release.
+async fn count_issue_release(
+    conn: &mut SqliteConnection,
+    issue_id: i64,
+    release: &str,
+    now: DateTime<Utc>,
+) -> Result<bool, DaemonError> {
+    let count: i64 = sqlx::query_scalar(
+        "INSERT INTO issue_releases (issue_id, release, event_count, first_seen, last_seen) \
+         VALUES (?, ?, 1, ?, ?) \
+         ON CONFLICT(issue_id, release) DO UPDATE SET \
+             event_count = event_count + 1, \
+             first_seen = MIN(first_seen, excluded.first_seen), \
+             last_seen = MAX(last_seen, excluded.last_seen) \
+         RETURNING event_count",
+    )
+    .bind(issue_id)
+    .bind(release)
+    .bind(now)
+    .bind(now)
+    .fetch_one(&mut *conn)
+    .await?;
+    Ok(count == 1)
+}
+
 fn generate_token() -> String {
     // `Uuid::new_v4().simple()` → 32 lowercase hex chars, 122 bits of
     // entropy. We don't want hyphens (some operators paste this into env
@@ -1509,6 +1868,10 @@ struct IssueRow {
     event_count: i64,
     first_seen: String,
     last_seen: String,
+    first_release: Option<String>,
+    last_release: Option<String>,
+    newest_release: Option<String>,
+    resolved_in_release: Option<String>,
 }
 
 impl From<IssueRow> for Issue {
@@ -1531,6 +1894,10 @@ impl From<IssueRow> for Issue {
             event_count: r.event_count,
             first_seen: parse(&r.first_seen),
             last_seen: parse(&r.last_seen),
+            first_release: r.first_release,
+            last_release: r.last_release,
+            newest_release: r.newest_release,
+            resolved_in_release: r.resolved_in_release,
         }
     }
 }

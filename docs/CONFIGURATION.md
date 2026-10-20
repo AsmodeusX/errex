@@ -28,7 +28,7 @@ self-host.
 | `ERREX_TELEGRAM_BOT_TOKEN_FILE` | _(unset)_ | File holding the Telegram bot token (preferred; works with systemd `LoadCredential=`) |
 | `ERREX_TELEGRAM_BOT_TOKEN` | _(unset)_ | Telegram bot token, when a file is not practical |
 | `ERREX_TELEGRAM_CHAT_ID` | _(unset)_ | Group or channel to alert (`-100…` or `@name`). Telegram alerts are on when this and a token are set. |
-| `ERREX_TELEGRAM_MAX_PER_MIN` | `10` | Telegram messages per minute for new issues and regressions; `0` = unlimited. Pages have their own budget. |
+| `ERREX_TELEGRAM_MAX_PER_MIN` | `10` | Telegram messages per minute for new issues, regressions and new releases; `0` = unlimited. Pages have their own budget. |
 | `ERREX_TELEGRAM_MIN_LEVEL` | `error` | Lowest issue level alerted on Telegram (`debug`, `info`, `warning`, `error`, `fatal`); an issue without a level counts as `error`. Pages are always alerted. |
 | `ERREX_DROP_EVENTS` | _(empty)_ | Events dropped at ingest, answered 200 and never stored. See [Drop rules](#drop-rules). |
 | `ERREX_PUBLIC_URL` | `http://localhost:9090` | **Set this for any non-localhost deployment.** Embedded in DSNs, webhook payloads, and the dashboard's curl example. The daemon warns at boot if you bound to a public interface but left this at the default. |
@@ -199,7 +199,35 @@ Set a webhook URL on a project and errex will POST a Slack-compatible
 payload on:
 
 - **First occurrence** of a new fingerprint (color: `danger`)
-- **Regression** — a resolved issue saw a new event (color: `warning`)
+- **Regression** — a resolved issue saw an event from a release newer than
+  the one it was resolved in: "Regressed in <release>" (color: `warning`)
+- **New release** — an open issue's first event from a release newer than
+  every release that reported it before: "Now also in <release>" (color:
+  `warning`)
+
+Each issue alerts at most once per release; repeat events in a release it
+already alerted for, or from an older release, only count.
+
+### Releases
+
+An issue is one row per fingerprint whatever the release; errex records
+which releases reported it (first, last and newest release, and a count
+with first and last sighting per release), shown on the issue page and at
+`GET /api/issues/:id/releases`.
+
+Resolving an issue records the release it is resolved in: the project's
+newest release by default, or the one named in `PUT
+/api/issues/:id/status` (`{"status":"resolved","release":"…"}`, a release
+the project has reported) or picked on the issue page. Events from that
+release or an older one only count, because builds still in the field keep
+reporting a fixed defect; an event from a newer release regresses the
+issue. An event without a release, or an issue resolved when its project
+had reported no release, regresses as soon as an event arrives.
+
+Release order: two releases ending in an integer build (`app@1.2.3+45`)
+order by build; otherwise two dotted versions order by semantic version;
+otherwise the release that first reported anything earlier is the older.
+`GET /api/projects/:name/releases` lists a project's releases newest first.
 
 Slack / Discord (with the `/slack` suffix) / Teams "Incoming Webhook"
 all accept the same shape.
@@ -217,8 +245,8 @@ issue's state.
 
 One bot posts to one group or channel, on the same triggers as the
 webhooks plus pages. Each message names the project, level, title,
-release, event count and the issue's dashboard link. New issues and
-regressions share `ERREX_TELEGRAM_MAX_PER_MIN`; what that holds back is
+release, event count and the issue's dashboard link. New issues,
+regressions and new releases share `ERREX_TELEGRAM_MAX_PER_MIN`; what that holds back is
 counted in the next message. Pages have their own budget at Telegram's
 group limit, so a burst of new issues cannot delay one.
 

@@ -202,6 +202,7 @@ pub fn prepare(project: String, mut event: Event) -> IngestEvent {
     let release = event
         .release
         .clone()
+        .filter(|r| !r.is_empty())
         .map(|r| truncate_chars(r, MAX_LABEL_CHARS));
     let title = truncate_chars(event.title(), MAX_LABEL_CHARS);
     let level = event.level.map(level_str);
@@ -316,6 +317,7 @@ async fn process_batch(
             now: rec.received_at,
             event_id: &rec.event_id,
             payload: &rec.payload,
+            release: rec.release.as_deref(),
         })
         .collect();
 
@@ -345,7 +347,17 @@ async fn process_batch(
                 project = %rec.project,
                 issue_id = result.issue.id,
                 fingerprint = %rec.fingerprint,
+                release = rec.release.as_deref().unwrap_or("-"),
                 "issue regressed: {}",
+                rec.title,
+            );
+        } else if result.new_release {
+            tracing::info!(
+                project = %rec.project,
+                issue_id = result.issue.id,
+                fingerprint = %rec.fingerprint,
+                release = rec.release.as_deref().unwrap_or("-"),
+                "issue seen in a newer release: {}",
                 rec.title,
             );
         } else {
@@ -366,6 +378,8 @@ async fn process_batch(
             Some(TriggerKind::NewIssue)
         } else if result.regressed {
             Some(TriggerKind::Regression)
+        } else if result.new_release {
+            Some(TriggerKind::NewRelease)
         } else {
             None
         };
@@ -572,6 +586,11 @@ mod tests {
             rec.release.as_deref(),
             Some("com.zeusmotorsport.suite@1.2.3+45")
         );
+        let empty = prepare(
+            "p".into(),
+            ev(serde_json::json!({ "message": "m", "release": "" })),
+        );
+        assert_eq!(empty.release, None, "an empty release is no release");
     }
 
     #[test]

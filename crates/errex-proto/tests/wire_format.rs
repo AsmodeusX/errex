@@ -260,6 +260,10 @@ fn issue_round_trips_through_json() {
         event_count: 7,
         first_seen: fixed_ts(),
         last_seen: fixed_ts(),
+        first_release: None,
+        last_release: None,
+        newest_release: None,
+        resolved_in_release: None,
     };
     let v = serde_json::to_value(&issue).unwrap();
     // Names the SPA reads must be exactly these.
@@ -282,6 +286,38 @@ fn issue_round_trips_through_json() {
     assert_eq!(round.event_count, 7);
     assert_eq!(round.fingerprint.as_str(), "abc123");
     assert_eq!(round.status, IssueStatus::Unresolved);
+}
+
+#[test]
+fn issue_release_fields_round_trip_and_default_when_absent() {
+    let mut issue: Issue = serde_json::from_value(serde_json::json!({
+        "id": 1, "project": "p", "fingerprint": "fp", "title": "t",
+        "culprit": null, "level": null, "status": "resolved", "event_count": 1,
+        "first_seen": "2026-01-01T00:00:00Z", "last_seen": "2026-01-01T00:00:00Z"
+    }))
+    .expect("a payload from an older daemon still parses");
+    assert_eq!(issue.first_release, None);
+    assert_eq!(issue.resolved_in_release, None);
+
+    issue.first_release = Some("zeus-suite@0.0.14+11".into());
+    issue.last_release = Some("zeus-suite@0.0.15+12".into());
+    issue.newest_release = Some("zeus-suite@0.0.15+12".into());
+    issue.resolved_in_release = Some("zeus-suite@0.0.15+12".into());
+    let v = serde_json::to_value(&issue).unwrap();
+    for name in [
+        "first_release",
+        "last_release",
+        "newest_release",
+        "resolved_in_release",
+    ] {
+        assert!(v.get(name).is_some(), "missing wire field: {name}");
+    }
+    let round: Issue = serde_json::from_value(v).unwrap();
+    assert_eq!(
+        round.resolved_in_release.as_deref(),
+        Some("zeus-suite@0.0.15+12")
+    );
+    assert_eq!(round.first_release.as_deref(), Some("zeus-suite@0.0.14+11"));
 }
 
 #[test]
@@ -370,6 +406,10 @@ fn server_message_issue_created_and_updated_use_distinct_tags() {
         event_count: 1,
         first_seen: fixed_ts(),
         last_seen: fixed_ts(),
+        first_release: None,
+        last_release: None,
+        newest_release: None,
+        resolved_in_release: None,
     };
     let created = serde_json::to_value(ServerMessage::IssueCreated {
         issue: issue.clone(),

@@ -131,6 +131,8 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/issues", get(list_issues))
         .route("/api/issues/:id/event", get(latest_event))
         .route("/api/issues/:id/status", axum::routing::put(put_status))
+        .route("/api/issues/:id/releases", get(issue_releases))
+        .route("/api/projects/:name/releases", get(project_releases))
         // ----- auth -----
         .route("/api/auth/setup", post(crate::auth::handle_setup))
         .route(
@@ -380,12 +382,16 @@ async fn list_issues(
 }
 
 /// PUT /api/issues/:id/status — sets triage status. The body is
-/// `{"status": "unresolved" | "resolved" | "muted" | "ignored"}`. Unknown
-/// statuses return 400 (caught by the strict serde enum); unknown ids
-/// return 404 via the `NotFound` arm of `DaemonError`.
+/// `{"status": "unresolved" | "resolved" | "muted" | "ignored"}`, and a
+/// resolve may name the release it is resolved in as `"release"` (default:
+/// the project's newest release). Unknown statuses, and a release the
+/// project never reported, return 400; unknown ids return 404 via the
+/// `NotFound` arm of `DaemonError`.
 #[derive(Debug, serde::Deserialize)]
 struct StatusBody {
     status: errex_proto::IssueStatus,
+    #[serde(default)]
+    release: Option<String>,
 }
 
 async fn put_status(
@@ -402,7 +408,11 @@ async fn put_status(
     let Some(Json(body)) = body else {
         return Ok((StatusCode::BAD_REQUEST, "invalid status body").into_response());
     };
-    match state.store.set_status(id, body.status).await {
+    match state
+        .store
+        .set_status(id, body.status, body.release.as_deref())
+        .await
+    {
         Ok(issue) => {
             // Best-effort broadcast: a missing receiver only means no client
             // is subscribed, which is harmless — they'll catch up via the
@@ -416,8 +426,41 @@ async fn put_status(
         Err(DaemonError::NotFound(_)) => {
             Ok((StatusCode::NOT_FOUND, "issue not found").into_response())
         }
+        Err(DaemonError::Invalid(why)) => Ok((StatusCode::BAD_REQUEST, why).into_response()),
         Err(other) => Err(other.into()),
     }
+}
+
+/// GET /api/issues/:id/releases — the releases that reported the issue,
+/// newest first, each with its event count and first and last sighting.
+async fn issue_releases(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<i64>,
+    headers: axum::http::HeaderMap,
+) -> Result<Response, ApiError> {
+    if let Err(resp) = crate::auth::require_auth(&state, &headers).await {
+        return Ok(resp);
+    }
+    match state.store.issue_releases(id).await {
+        Ok(releases) => Ok(Json(releases).into_response()),
+        Err(DaemonError::NotFound(_)) => {
+            Ok((StatusCode::NOT_FOUND, "issue not found").into_response())
+        }
+        Err(other) => Err(other.into()),
+    }
+}
+
+/// GET /api/projects/:name/releases — every release the project has
+/// reported, newest first. The SPA offers these when resolving an issue.
+async fn project_releases(
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+    headers: axum::http::HeaderMap,
+) -> Result<Response, ApiError> {
+    if let Err(resp) = crate::auth::require_auth(&state, &headers).await {
+        return Ok(resp);
+    }
+    Ok(Json(state.store.project_releases(&name).await?).into_response())
 }
 
 /// Latest event payload for an issue, returned as the verbatim Event JSON.

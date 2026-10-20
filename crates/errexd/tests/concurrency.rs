@@ -117,6 +117,7 @@ async fn pool_one_holds_under_concurrent_readers_and_writer() {
             now,
             event_id: &event_id,
             payload: &payload,
+            release: None,
         }];
         store.upsert_batch_with_events(&inputs).await.unwrap();
     }
@@ -143,6 +144,7 @@ async fn pool_one_holds_under_concurrent_readers_and_writer() {
                     now,
                     event_id: &event_id,
                     payload: &payload,
+                    release: None,
                 }];
                 store.upsert_batch_with_events(&inputs).await.unwrap();
                 seed = seed.wrapping_add(1);

@@ -23,6 +23,11 @@ pub enum DaemonError {
     #[error("not found: {0}")]
     NotFound(String),
 
+    /// 400-equivalent: the caller named something that cannot be used, such
+    /// as a release its project never reported.
+    #[error("invalid: {0}")]
+    Invalid(String),
+
     /// Catch-all for crypto/parse/etc. failures whose underlying error type
     /// we don't want to leak through `From`. Constructed via `Crypto(msg)`.
     #[error("{0}")]

@@ -238,8 +238,12 @@ pub struct Trigger {
 pub enum TriggerKind {
     /// First occurrence of a fingerprint — always notify.
     NewIssue,
-    /// Resolved issue saw a fresh event — also notify.
+    /// Resolved issue saw an event from a release newer than the one it was
+    /// resolved in — also notify.
     Regression,
+    /// An open issue's first event from a release newer than every release
+    /// that reported it before. Once per issue per release.
+    NewRelease,
     /// An event matched the paging rule (`digest::pages`). Fires on every
     /// such event, whatever the issue's state: each one is a different car.
     Page,
@@ -250,6 +254,7 @@ impl TriggerKind {
         match self {
             TriggerKind::NewIssue => "New issue",
             TriggerKind::Regression => "Regression",
+            TriggerKind::NewRelease => "New release",
             TriggerKind::Page => "PAGE: fatal with erased flash",
         }
     }
@@ -257,7 +262,19 @@ impl TriggerKind {
         // Slack/Discord both interpret these named colors.
         match self {
             TriggerKind::NewIssue | TriggerKind::Page => "danger",
-            TriggerKind::Regression => "warning",
+            TriggerKind::Regression | TriggerKind::NewRelease => "warning",
+        }
+    }
+}
+
+impl Trigger {
+    /// The alert's first line: the kind, naming the release where the kind
+    /// is about one.
+    pub fn headline(&self) -> String {
+        match (self.kind, self.release.as_deref()) {
+            (TriggerKind::Regression, Some(release)) => format!("Regressed in {release}"),
+            (TriggerKind::NewRelease, Some(release)) => format!("Now also in {release}"),
+            (kind, _) => kind.label().to_string(),
         }
     }
 }
@@ -290,7 +307,7 @@ impl AlertSinks {
 /// compatible" webhook endpoints accept the same shape.
 pub fn build_payload(t: &Trigger, public_url: &str) -> Value {
     let issue = &t.issue;
-    let title = format!("{}: {}", t.kind.label(), issue.title);
+    let title = format!("{}: {}", t.headline(), issue.title);
     let link = format!("{}/issues/{}", public_url.trim_end_matches('/'), issue.id);
     let mut fields = vec![
         json!({"title": "Project", "value": issue.project, "short": true}),
@@ -403,6 +420,10 @@ mod tests {
             event_count: 7,
             first_seen: Utc::now(),
             last_seen: Utc::now(),
+            first_release: None,
+            last_release: None,
+            newest_release: None,
+            resolved_in_release: None,
         }
     }
 
@@ -538,6 +559,26 @@ mod tests {
     }
 
     #[test]
+    fn regression_and_new_release_payloads_name_the_release() {
+        let t = |kind| Trigger {
+            issue: issue(),
+            kind,
+            release: Some("zeus-suite@0.0.15+12".into()),
+        };
+        let v = build_payload(&t(TriggerKind::Regression), "https://errex.example.com");
+        assert_eq!(
+            v["text"].as_str().unwrap(),
+            "Regressed in zeus-suite@0.0.15+12: TypeError: x"
+        );
+        let v = build_payload(&t(TriggerKind::NewRelease), "https://errex.example.com");
+        assert_eq!(
+            v["text"].as_str().unwrap(),
+            "Now also in zeus-suite@0.0.15+12: TypeError: x"
+        );
+        assert_eq!(v.pointer("/attachments/0/color").unwrap(), "warning");
+    }
+
+    #[test]
     fn payload_carries_the_release_when_known() {
         let t = Trigger {
             issue: issue(),
@@ -567,6 +608,7 @@ mod tests {
         };
         assert!(!should_alert(&t(TriggerKind::NewIssue)));
         assert!(!should_alert(&t(TriggerKind::Regression)));
+        assert!(!should_alert(&t(TriggerKind::NewRelease)));
         assert!(should_alert(&t(TriggerKind::Page)));
     }
 

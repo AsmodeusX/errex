@@ -6,6 +6,7 @@ pub mod error;
 pub mod event;
 pub mod fingerprint;
 pub mod issue;
+pub mod release;
 pub mod wire;
 
 pub use error::ProtoError;

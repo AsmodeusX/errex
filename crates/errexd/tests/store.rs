@@ -28,7 +28,7 @@ mod error;
 #[path = "../src/store.rs"]
 mod store;
 
-use store::{BatchUpsertInput, RetentionSettings, Role, StorageStats, Store};
+use store::{BatchUpsertInput, RetentionSettings, Role, StorageStats, Store, UpsertResult};
 
 // ----- helpers -----
 
@@ -345,6 +345,7 @@ async fn upsert_batch_persists_two_distinct_fingerprints() {
             now,
             event_id: &id_a,
             payload: &pl_a,
+            release: None,
         },
         BatchUpsertInput {
             project: "p",
@@ -355,6 +356,7 @@ async fn upsert_batch_persists_two_distinct_fingerprints() {
             now,
             event_id: &id_b,
             payload: &pl_b,
+            release: None,
         },
     ];
     let res = store.upsert_batch_with_events(&batch).await.unwrap();
@@ -393,6 +395,7 @@ async fn upsert_batch_dedupes_same_fingerprint_within_one_call() {
             now,
             event_id: &id1,
             payload: &pl1,
+            release: None,
         },
         BatchUpsertInput {
             project: "p",
@@ -403,6 +406,7 @@ async fn upsert_batch_dedupes_same_fingerprint_within_one_call() {
             now,
             event_id: &id2,
             payload: &pl2,
+            release: None,
         },
     ];
     let res = store.upsert_batch_with_events(&batch).await.unwrap();
@@ -425,7 +429,7 @@ async fn upsert_batch_flags_regression_for_resolved_issue() {
         .await
         .unwrap();
     store
-        .set_status(initial.issue.id, IssueStatus::Resolved)
+        .set_status(initial.issue.id, IssueStatus::Resolved, None)
         .await
         .unwrap();
 
@@ -441,6 +445,7 @@ async fn upsert_batch_flags_regression_for_resolved_issue() {
         now: Utc::now(),
         event_id: &eid,
         payload: &pl,
+        release: None,
     }];
     let res = store.upsert_batch_with_events(&batch).await.unwrap();
     assert!(!res[0].created);
@@ -465,6 +470,7 @@ async fn upsert_batch_dedupes_event_id_via_unique_constraint() {
         now: Utc::now(),
         event_id: &eid,
         payload: &pl,
+        release: None,
     }];
     store.upsert_batch_with_events(&batch1).await.unwrap();
     // Replay with the same event payload → ON CONFLICT silently no-ops the
@@ -479,6 +485,7 @@ async fn upsert_batch_dedupes_event_id_via_unique_constraint() {
         now: Utc::now(),
         event_id: &eid,
         payload: &pl,
+        release: None,
     }];
     store.upsert_batch_with_events(&batch2).await.unwrap();
 
@@ -930,7 +937,7 @@ async fn set_status_persists_and_round_trips() {
         .await
         .unwrap();
     store
-        .set_status(r.issue.id, IssueStatus::Resolved)
+        .set_status(r.issue.id, IssueStatus::Resolved, None)
         .await
         .unwrap();
     let issues = store.load_issues().await.unwrap();
@@ -946,7 +953,7 @@ async fn set_status_returns_updated_issue() {
         .await
         .unwrap();
     let updated = store
-        .set_status(r.issue.id, IssueStatus::Muted)
+        .set_status(r.issue.id, IssueStatus::Muted, None)
         .await
         .unwrap();
     assert_eq!(updated.id, r.issue.id);
@@ -956,7 +963,7 @@ async fn set_status_returns_updated_issue() {
 #[tokio::test]
 async fn set_status_on_unknown_issue_is_an_error() {
     let (store, _dir) = fresh_store().await;
-    let res = store.set_status(999_999, IssueStatus::Resolved).await;
+    let res = store.set_status(999_999, IssueStatus::Resolved, None).await;
     assert!(res.is_err(), "missing issue must surface as Err");
 }
 
@@ -969,7 +976,7 @@ async fn ingesting_event_for_resolved_issue_regresses_to_unresolved() {
         .await
         .unwrap();
     store
-        .set_status(r1.issue.id, IssueStatus::Resolved)
+        .set_status(r1.issue.id, IssueStatus::Resolved, None)
         .await
         .unwrap();
     let r2 = store
@@ -991,7 +998,7 @@ async fn upsert_keeps_muted_status() {
         .await
         .unwrap();
     store
-        .set_status(r1.issue.id, IssueStatus::Muted)
+        .set_status(r1.issue.id, IssueStatus::Muted, None)
         .await
         .unwrap();
     let r2 = store
@@ -1010,7 +1017,7 @@ async fn upsert_keeps_ignored_status() {
         .await
         .unwrap();
     store
-        .set_status(r1.issue.id, IssueStatus::Ignored)
+        .set_status(r1.issue.id, IssueStatus::Ignored, None)
         .await
         .unwrap();
     let r2 = store
@@ -2202,6 +2209,7 @@ async fn replayed_event_does_not_bump_count_or_reopen_issue() {
         now,
         event_id: &id,
         payload: &pl,
+        release: None,
     }];
     store.upsert_batch_with_events(&batch).await.unwrap();
     sqlx::query("UPDATE issues SET status = 'resolved'")
@@ -2256,4 +2264,532 @@ async fn password_change_revokes_existing_sessions() {
 
     store.set_user_password("bob", "new-hash").await.unwrap();
     assert!(store.session_for_id("sess-1").await.unwrap().is_none());
+}
+
+// ----- releases -----
+//
+// One issue per defect across releases; a resolve records the release it
+// is resolved in; alerts fire once per issue per release. These drive the
+// digest's batch path, which is what ingest uses.
+
+const B11: &str = "zeus-suite@0.0.14+11";
+const B12: &str = "zeus-suite@0.0.15+12";
+const B13: &str = "zeus-suite@0.0.16+13";
+const B14: &str = "zeus-suite@0.0.17+14";
+
+/// One event for fingerprint `f` from `release`, received at `t`.
+async fn event_in(
+    store: &Store,
+    f: &str,
+    release: Option<&str>,
+    t: chrono::DateTime<Utc>,
+) -> UpsertResult {
+    let mut ev = sample_event("FlashError", "v", "flash", 1);
+    ev.release = release.map(Into::into);
+    let (event_id, payload) = precomputed(&ev);
+    let fingerprint = fp(f);
+    store
+        .upsert_batch_with_events(&[BatchUpsertInput {
+            project: "p",
+            fp: &fingerprint,
+            title: "FlashError: v",
+            culprit: None,
+            level: Some("error"),
+            now: t,
+            event_id: &event_id,
+            payload: &payload,
+            release,
+        }])
+        .await
+        .unwrap()
+        .remove(0)
+}
+
+fn quiet(r: &UpsertResult) -> bool {
+    !r.created && !r.regressed && !r.new_release
+}
+
+#[tokio::test]
+async fn repeat_events_in_one_release_are_one_issue_and_never_alert() {
+    let (store, _dir) = fresh_store().await;
+    let t = Utc::now();
+    let first = event_in(&store, "a", Some(B12), t).await;
+    assert!(first.created && !first.new_release);
+    for i in 1..4 {
+        let r = event_in(&store, "a", Some(B12), t + Duration::seconds(i)).await;
+        assert!(quiet(&r), "repeat {i} in the same release alerted");
+        assert_eq!(r.issue.id, first.issue.id);
+    }
+    let issue = &store.load_issues().await.unwrap()[0];
+    assert_eq!(issue.event_count, 4);
+    assert_eq!(issue.first_release.as_deref(), Some(B12));
+    assert_eq!(issue.newest_release.as_deref(), Some(B12));
+    let releases = store.issue_releases(issue.id).await.unwrap();
+    assert_eq!(releases.len(), 1);
+    assert_eq!(releases[0].release, B12);
+    assert_eq!(releases[0].event_count, 4);
+    assert_eq!(releases[0].first_seen, t);
+    assert_eq!(releases[0].last_seen, t + Duration::seconds(3));
+}
+
+#[tokio::test]
+async fn an_open_issue_alerts_once_when_a_newer_release_first_reports_it() {
+    let (store, _dir) = fresh_store().await;
+    let t = Utc::now();
+    event_in(&store, "a", Some(B12), t).await;
+    let r = event_in(&store, "a", Some(B13), t + Duration::seconds(1)).await;
+    assert!(r.new_release && !r.created && !r.regressed);
+    assert!(quiet(
+        &event_in(&store, "a", Some(B13), t + Duration::seconds(2)).await
+    ));
+    assert!(
+        quiet(&event_in(&store, "a", Some(B12), t + Duration::seconds(3)).await),
+        "an older release already seen"
+    );
+    assert!(
+        quiet(&event_in(&store, "a", Some(B11), t + Duration::seconds(4)).await),
+        "an older release seen for the first time is not newer"
+    );
+    let r = event_in(&store, "a", None, t + Duration::seconds(5)).await;
+    assert!(quiet(&r), "an event without a release");
+    let issue = r.issue;
+    assert_eq!(issue.first_release.as_deref(), Some(B12));
+    assert_eq!(issue.last_release.as_deref(), Some(B11));
+    assert_eq!(issue.newest_release.as_deref(), Some(B13));
+    assert_eq!(issue.event_count, 6);
+    let order: Vec<_> = store
+        .issue_releases(issue.id)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|r| (r.release, r.event_count))
+        .collect();
+    assert_eq!(
+        order,
+        vec![(B13.into(), 2), (B12.into(), 2), (B11.into(), 1)],
+        "newest first"
+    );
+}
+
+#[tokio::test]
+async fn a_muted_issue_reports_its_new_release_for_the_alert_sinks_to_drop() {
+    let (store, _dir) = fresh_store().await;
+    let t = Utc::now();
+    let r = event_in(&store, "a", Some(B12), t).await;
+    store
+        .set_status(r.issue.id, IssueStatus::Muted, None)
+        .await
+        .unwrap();
+    let r = event_in(&store, "a", Some(B13), t + Duration::seconds(1)).await;
+    assert!(r.new_release && !r.regressed);
+    assert_eq!(r.issue.status, IssueStatus::Muted);
+}
+
+#[tokio::test]
+async fn resolving_defaults_to_the_projects_newest_release() {
+    let (store, _dir) = fresh_store().await;
+    let t = Utc::now();
+    let a = event_in(&store, "a", Some(B12), t).await;
+    event_in(&store, "b", Some(B13), t + Duration::seconds(1)).await;
+    let resolved = store
+        .set_status(a.issue.id, IssueStatus::Resolved, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        resolved.resolved_in_release.as_deref(),
+        Some(B13),
+        "newest in the project, not just in the issue"
+    );
+    let reopened = store
+        .set_status(a.issue.id, IssueStatus::Unresolved, None)
+        .await
+        .unwrap();
+    assert_eq!(reopened.resolved_in_release, None);
+}
+
+#[tokio::test]
+async fn resolving_in_a_named_release_needs_one_the_project_reported() {
+    let (store, _dir) = fresh_store().await;
+    let a = event_in(&store, "a", Some(B12), Utc::now()).await;
+    let named = store
+        .set_status(a.issue.id, IssueStatus::Resolved, Some(B12))
+        .await
+        .unwrap();
+    assert_eq!(named.resolved_in_release.as_deref(), Some(B12));
+    let err = store
+        .set_status(a.issue.id, IssueStatus::Resolved, Some(B14))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, error::DaemonError::Invalid(_)), "{err:?}");
+    let issue = &store.load_issues().await.unwrap()[0];
+    assert_eq!(issue.resolved_in_release.as_deref(), Some(B12), "unchanged");
+}
+
+#[tokio::test]
+async fn resolved_in_a_release_then_an_older_release_only_counts() {
+    let (store, _dir) = fresh_store().await;
+    let t = Utc::now();
+    let a = event_in(&store, "a", Some(B12), t).await;
+    event_in(&store, "a", Some(B13), t + Duration::seconds(1)).await;
+    store
+        .set_status(a.issue.id, IssueStatus::Resolved, None)
+        .await
+        .unwrap();
+    for (i, release) in [B12, B13, B11].into_iter().enumerate() {
+        let r = event_in(
+            &store,
+            "a",
+            Some(release),
+            t + Duration::seconds(2 + i as i64),
+        )
+        .await;
+        assert!(quiet(&r), "{release} is at or below the resolved release");
+        assert_eq!(r.issue.status, IssueStatus::Resolved);
+        assert_eq!(r.issue.resolved_in_release.as_deref(), Some(B13));
+    }
+    let issue = &store.load_issues().await.unwrap()[0];
+    assert_eq!(issue.event_count, 5, "every event counts");
+    assert_eq!(issue.last_release.as_deref(), Some(B11));
+}
+
+#[tokio::test]
+async fn resolved_in_a_release_then_a_newer_release_regresses_once() {
+    let (store, _dir) = fresh_store().await;
+    let t = Utc::now();
+    let a = event_in(&store, "a", Some(B12), t).await;
+    store
+        .set_status(a.issue.id, IssueStatus::Resolved, None)
+        .await
+        .unwrap();
+    let r = event_in(&store, "a", Some(B13), t + Duration::seconds(1)).await;
+    assert!(r.regressed && !r.new_release && !r.created);
+    assert_eq!(r.issue.status, IssueStatus::Unresolved);
+    assert_eq!(r.issue.resolved_in_release, None);
+    assert_eq!(r.issue.newest_release.as_deref(), Some(B13));
+    assert!(quiet(
+        &event_in(&store, "a", Some(B13), t + Duration::seconds(2)).await
+    ));
+    assert!(quiet(
+        &event_in(&store, "a", Some(B12), t + Duration::seconds(3)).await
+    ));
+    let r = event_in(&store, "a", Some(B14), t + Duration::seconds(4)).await;
+    assert!(r.new_release, "open again, so a newer release alerts once");
+}
+
+#[tokio::test]
+async fn resolved_in_an_older_release_than_the_issue_has_seen() {
+    let (store, _dir) = fresh_store().await;
+    let t = Utc::now();
+    let a = event_in(&store, "a", Some(B12), t).await;
+    event_in(&store, "a", Some(B13), t + Duration::seconds(1)).await;
+    store
+        .set_status(a.issue.id, IssueStatus::Resolved, Some(B12))
+        .await
+        .unwrap();
+    let r = event_in(&store, "a", Some(B13), t + Duration::seconds(2)).await;
+    assert!(
+        r.regressed,
+        "13 is newer than the release it was resolved in"
+    );
+}
+
+#[tokio::test]
+async fn events_without_a_release_regress_a_resolved_issue_as_before() {
+    let (store, _dir) = fresh_store().await;
+    let t = Utc::now();
+    let a = event_in(&store, "a", None, t).await;
+    let resolved = store
+        .set_status(a.issue.id, IssueStatus::Resolved, None)
+        .await
+        .unwrap();
+    assert_eq!(resolved.resolved_in_release, None, "no release to name");
+    let r = event_in(&store, "a", Some(B12), t + Duration::seconds(1)).await;
+    assert!(r.regressed, "resolved in no release: any event regresses");
+
+    let b = event_in(&store, "b", Some(B12), t).await;
+    store
+        .set_status(b.issue.id, IssueStatus::Resolved, None)
+        .await
+        .unwrap();
+    let r = event_in(&store, "b", None, t + Duration::seconds(1)).await;
+    assert!(
+        r.regressed,
+        "an event without a release cannot be shown to be old"
+    );
+}
+
+#[tokio::test]
+async fn releases_order_by_build_number_before_version() {
+    let (store, _dir) = fresh_store().await;
+    let t = Utc::now();
+    let newer_build = "zeus-suite@0.0.9+10";
+    let older_build = "zeus-suite@0.0.10+9";
+    let a = event_in(&store, "a", Some(newer_build), t).await;
+    let r = event_in(&store, "a", Some(older_build), t + Duration::seconds(1)).await;
+    assert!(quiet(&r), "build 9 is older than build 10");
+    assert_eq!(r.issue.newest_release.as_deref(), Some(newer_build));
+    store
+        .set_status(a.issue.id, IssueStatus::Resolved, None)
+        .await
+        .unwrap();
+    let resolved = &store.load_issues().await.unwrap()[0];
+    assert_eq!(resolved.resolved_in_release.as_deref(), Some(newer_build));
+    let r = event_in(&store, "a", Some(older_build), t + Duration::seconds(2)).await;
+    assert!(quiet(&r) && r.issue.status == IssueStatus::Resolved);
+    let r = event_in(
+        &store,
+        "a",
+        Some("zeus-suite@0.0.9+11"),
+        t + Duration::seconds(3),
+    )
+    .await;
+    assert!(r.regressed);
+    let listed: Vec<_> = store
+        .project_releases("p")
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|r| r.release)
+        .collect();
+    assert_eq!(
+        listed,
+        vec!["zeus-suite@0.0.9+11", newer_build, older_build]
+    );
+}
+
+#[tokio::test]
+async fn releases_without_a_version_order_by_first_sighting() {
+    let (store, _dir) = fresh_store().await;
+    let t = Utc::now();
+    let a = event_in(&store, "a", Some("5114f85"), t).await;
+    let r = event_in(&store, "a", Some("9ac0e21"), t + Duration::seconds(10)).await;
+    assert!(r.new_release, "first reported later, so newer");
+    store
+        .set_status(a.issue.id, IssueStatus::Resolved, None)
+        .await
+        .unwrap();
+    let r = event_in(&store, "a", Some("5114f85"), t + Duration::seconds(20)).await;
+    assert!(quiet(&r));
+    let r = event_in(&store, "a", Some("0aa0aa0"), t + Duration::seconds(30)).await;
+    assert!(r.regressed, "a release first seen after the resolved one");
+    assert_eq!(
+        store::release_order("x", Some("2026-01-01T00:00:00Z"), "y", None),
+        std::cmp::Ordering::Greater,
+        "a release with no record sorts below a recorded one"
+    );
+}
+
+#[tokio::test]
+async fn a_replayed_event_counts_against_no_release() {
+    let (store, _dir) = fresh_store().await;
+    let mut ev = sample_event("E", "v", "f", 1);
+    ev.release = Some(B12.into());
+    let (event_id, payload) = precomputed(&ev);
+    let f = fp("a");
+    let input = BatchUpsertInput {
+        project: "p",
+        fp: &f,
+        title: "T",
+        culprit: None,
+        level: None,
+        now: Utc::now(),
+        event_id: &event_id,
+        payload: &payload,
+        release: Some(B12),
+    };
+    store.upsert_batch_with_events(&[input]).await.unwrap();
+    let input = BatchUpsertInput {
+        project: "p",
+        fp: &f,
+        title: "T",
+        culprit: None,
+        level: None,
+        now: Utc::now(),
+        event_id: &event_id,
+        payload: &payload,
+        release: Some(B13),
+    };
+    let r = store
+        .upsert_batch_with_events(&[input])
+        .await
+        .unwrap()
+        .remove(0);
+    assert!(quiet(&r));
+    let releases = store.issue_releases(r.issue.id).await.unwrap();
+    assert_eq!(releases.len(), 1);
+    assert_eq!(releases[0].event_count, 1);
+}
+
+#[tokio::test]
+async fn project_rename_and_delete_carry_its_releases() {
+    let (store, _dir) = fresh_store().await;
+    store.create_project("p").await.unwrap();
+    event_in(&store, "a", Some(B12), Utc::now()).await;
+    store.rename_project("p", "q").await.unwrap();
+    assert!(store.project_releases("p").await.unwrap().is_empty());
+    assert_eq!(store.project_releases("q").await.unwrap().len(), 1);
+    store.delete_project("q").await.unwrap();
+    assert!(store.project_releases("q").await.unwrap().is_empty());
+    let leftovers: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM issue_releases")
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
+    assert_eq!(leftovers, 0, "issue rows cascade to their release rows");
+}
+
+#[tokio::test]
+async fn issue_releases_of_an_unknown_issue_is_not_found() {
+    let (store, _dir) = fresh_store().await;
+    assert!(matches!(
+        store.issue_releases(42).await,
+        Err(error::DaemonError::NotFound(_))
+    ));
+}
+
+/// The releases migration upgrades a database the previous daemon wrote:
+/// every issue and event stays, and release rows are back-filled from the
+/// stored events.
+#[tokio::test]
+async fn releases_migration_backfills_a_database_the_previous_daemon_wrote() {
+    const RELEASES_MIGRATION: &str = "20261020000001";
+    let dir = unique_tempdir();
+    let earlier = dir.join("earlier-migrations");
+    std::fs::create_dir_all(&earlier).unwrap();
+    let migrations = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations");
+    for entry in std::fs::read_dir(&migrations).unwrap() {
+        let entry = entry.unwrap();
+        let name = entry.file_name().into_string().unwrap();
+        if name.as_str() < RELEASES_MIGRATION {
+            std::fs::copy(entry.path(), earlier.join(&name)).unwrap();
+        }
+    }
+    let store = Store::open(&dir.join("errex.db")).await.unwrap();
+    sqlx::migrate::Migrator::new(earlier.as_path())
+        .await
+        .unwrap()
+        .run(store.pool())
+        .await
+        .unwrap();
+
+    // What the previous daemon stored: issue 1 resolved, seen in builds 12
+    // and 13 (13 received first) plus an event with no release and one
+    // whose payload is not JSON; issue 2 open with versionless releases;
+    // issue 3 with every event purged by retention.
+    let at = |m: u32| format!("2026-10-01T10:{m:02}:00.000+00:00");
+    for (id, fp, status, count) in [
+        (1, "fa", "resolved", 6),
+        (2, "fb", "unresolved", 2),
+        (3, "fc", "resolved", 9),
+    ] {
+        sqlx::query(
+            "INSERT INTO issues (id, project, fingerprint, title, status, event_count, \
+             first_seen, last_seen) VALUES (?, 'p', ?, 'T', ?, ?, ?, ?)",
+        )
+        .bind(id)
+        .bind(fp)
+        .bind(status)
+        .bind(count)
+        .bind(at(0))
+        .bind(at(59))
+        .execute(store.pool())
+        .await
+        .unwrap();
+    }
+    let events: [(i64, &str, String, String); 7] = [
+        (1, "e1", format!(r#"{{"release":"{B13}"}}"#), at(1)),
+        (1, "e2", format!(r#"{{"release":"{B12}"}}"#), at(2)),
+        (1, "e3", format!(r#"{{"release":"{B12}"}}"#), at(3)),
+        (1, "e4", r#"{"message":"no release"}"#.into(), at(4)),
+        (1, "e5", "not json".into(), at(5)),
+        (2, "e6", r#"{"release":"5114f85"}"#.into(), at(6)),
+        (2, "e7", r#"{"release":"9ac0e21"}"#.into(), at(7)),
+    ];
+    for (issue_id, event_id, payload, received_at) in &events {
+        sqlx::query(
+            "INSERT INTO events (issue_id, event_id, payload, received_at) VALUES (?, ?, ?, ?)",
+        )
+        .bind(issue_id)
+        .bind(event_id)
+        .bind(payload)
+        .bind(received_at)
+        .execute(store.pool())
+        .await
+        .unwrap();
+    }
+
+    store.migrate().await.unwrap();
+
+    let issues = store.list_issues_by_project("p").await.unwrap();
+    assert_eq!(issues.len(), 3, "every issue kept");
+    let stored: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM events")
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
+    assert_eq!(stored, 7, "every event kept");
+    let by_id = |id: i64| issues.iter().find(|i| i.id == id).unwrap().clone();
+
+    let one = by_id(1);
+    assert_eq!(one.status, IssueStatus::Resolved);
+    assert_eq!(one.event_count, 6, "issue counters untouched");
+    assert_eq!(one.first_release.as_deref(), Some(B13), "first received");
+    assert_eq!(one.last_release.as_deref(), Some(B12), "last received");
+    assert_eq!(one.newest_release.as_deref(), Some(B13), "highest build");
+    assert_eq!(
+        one.resolved_in_release.as_deref(),
+        Some(B13),
+        "an already-resolved issue is resolved in its newest release"
+    );
+    let releases = store.issue_releases(1).await.unwrap();
+    let counts: Vec<_> = releases
+        .iter()
+        .map(|r| (r.release.as_str(), r.event_count))
+        .collect();
+    assert_eq!(counts, vec![(B13, 1), (B12, 2)]);
+    assert_eq!(
+        releases[1].first_seen.to_rfc3339(),
+        "2026-10-01T10:02:00+00:00"
+    );
+    assert_eq!(
+        releases[1].last_seen.to_rfc3339(),
+        "2026-10-01T10:03:00+00:00"
+    );
+
+    let two = by_id(2);
+    assert_eq!(
+        two.newest_release.as_deref(),
+        Some("9ac0e21"),
+        "by first sighting"
+    );
+    assert_eq!(
+        two.resolved_in_release, None,
+        "open issues are not resolved in anything"
+    );
+
+    let three = by_id(3);
+    assert_eq!(three.first_release, None);
+    assert_eq!(three.newest_release, None);
+    assert_eq!(three.resolved_in_release, None);
+    assert_eq!(three.status, IssueStatus::Resolved);
+
+    // Running it again (every later start) changes nothing.
+    store.migrate().await.unwrap();
+    assert_eq!(store.list_issues_by_project("p").await.unwrap().len(), 3);
+    assert_eq!(store.issue_releases(1).await.unwrap().len(), 2);
+
+    // And the upgraded issues follow the release rules.
+    let t = Utc::now();
+    let old = event_in(&store, "fa", Some(B12), t).await;
+    assert!(quiet(&old) && old.issue.status == IssueStatus::Resolved);
+    let newer = event_in(&store, "fa", Some(B14), t + Duration::seconds(1)).await;
+    assert!(newer.regressed);
+    let purged = event_in(&store, "fc", Some(B12), t).await;
+    assert!(
+        purged.regressed,
+        "resolved in no release: any event regresses"
+    );
+    let open = event_in(&store, "fb", Some("0aa0aa0"), t).await;
+    assert!(
+        open.new_release,
+        "a release first reported after the back-filled ones"
+    );
 }

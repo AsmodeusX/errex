@@ -109,6 +109,33 @@ describe('api.setStatus', () => {
     mockFetch({ ok: false, status: 404 });
     await expect(api.setStatus(99, 'resolved')).rejects.toThrow();
   });
+
+  it('names the release a resolve is in when given one', async () => {
+    const fetch = mockFetch({ ok: true, json: { ...baseIssue, status: 'resolved' } });
+    await api.setStatus(42, 'resolved', 'zeus-suite@0.0.15+12');
+    const [, init] = fetch.mock.calls[0]!;
+    expect(JSON.parse(init?.body as string)).toEqual({
+      status: 'resolved',
+      release: 'zeus-suite@0.0.15+12'
+    });
+  });
+});
+
+describe('api releases', () => {
+  it('issueReleases GETs /api/issues/:id/releases', async () => {
+    const rows = [
+      { release: 'a@1+2', event_count: 3, first_seen: 'x', last_seen: 'y' }
+    ];
+    const fetch = mockFetch({ ok: true, json: rows });
+    expect(await api.issueReleases(42)).toEqual(rows);
+    expect(fetch.mock.calls[0]![0]).toBe('/api/issues/42/releases');
+  });
+
+  it('projectReleases GETs /api/projects/:name/releases, encoding the name', async () => {
+    const fetch = mockFetch({ ok: true, json: [] });
+    await api.projectReleases('suite prod');
+    expect(fetch.mock.calls[0]![0]).toBe('/api/projects/suite%20prod/releases');
+  });
 });
 
 describe('api admin client (cookie auth)', () => {
