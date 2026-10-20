@@ -17,12 +17,13 @@ if ! [[ $host =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)
     exit 1
 fi
 
-mkdir -p "$out/nginx" "$out/systemd"
+mkdir -p "$out/nginx" "$out/systemd" "$out/rollback"
 sed "s/@ERREX_HOSTNAME@/$host/g" "$here/errexd.env.in" > "$out/errexd.env"
 sed "s/@ERREX_HOSTNAME@/$host/g" "$here/nginx/errex.conf.in" > "$out/nginx/$host.conf"
 cp "$here"/systemd/errexd.service "$here"/systemd/errex-backup.service \
     "$here"/systemd/errex-backup.timer "$out/systemd/"
 install -m 0755 "$here/errex-backup.sh" "$here/cloudflare-ips.sh" "$out/"
+cp "$here"/rollback/*.sql "$out/rollback/"
 if grep -rq '@ERREX_HOSTNAME@' "$out"; then
     echo "render: unsubstituted placeholder left in $out" >&2
     exit 1

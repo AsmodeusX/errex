@@ -64,7 +64,7 @@
       <thead class="text-muted-foreground text-left">
         <tr>
           <th class="py-1 pr-2 font-normal">Release</th>
-          <th class="py-1 pr-2 text-right font-normal">Events</th>
+          <th class="py-1 pr-4 text-right font-normal">Events</th>
           <th class="py-1 pr-2 font-normal">First</th>
           <th class="py-1 pr-2 font-normal">Last</th>
           <th class="py-1"></th>
@@ -79,7 +79,7 @@
                 <Badge variant="outline" class="ml-1 px-1.5 py-0 text-[10px]">resolved in</Badge>
               {/if}
             </td>
-            <td class="py-1 pr-2 text-right tabular-nums">{row.event_count}</td>
+            <td class="py-1 pr-4 text-right tabular-nums">{row.event_count}</td>
             <td class="py-1 pr-2 whitespace-nowrap">{relativeTime(row.first_seen)}</td>
             <td class="py-1 pr-2 whitespace-nowrap">{relativeTime(row.last_seen)}</td>
             <td class="py-1 text-right">

@@ -20,6 +20,7 @@ errexd ──> Telegram Bot API (alerts)          errex-backup.timer ──> /va
 | `systemd/errex-backup.{service,timer}`, `errex-backup.sh` | `/etc/systemd/system/`, `/usr/local/lib/errex/` |
 | `nginx/errex.conf.in` | `/etc/nginx/sites-available/<host>.conf` |
 | `cloudflare-ips.sh` | writes `/etc/nginx/snippets/cloudflare-origin-geo.conf`, prints the ufw rules |
+| `rollback/<migration>.sql` | run by hand to take the database back below that migration (see Operations) |
 
 The hostname is `bugtracker.zeusmotorsport.com` unless you pass another to
 `render.sh` (or set `ERREX_HOSTNAME`). The steps below write it as `$H`.
@@ -325,10 +326,47 @@ errex-backup.timer`, `sudo systemctl start errex-backup.service && ls -l
 
 ## Operations
 
-**Update:** build and copy a new `errex-release`, `sha256sum -c`, `sudo
-systemctl start errex-backup.service`, `sudo install -m 0755 errexd
-/usr/local/bin/errexd`, `sudo systemctl restart errexd`. Migrations run at
-start.
+**Update:** migrations run when errexd starts, so a release that brings
+one is rehearsed on a copy of the live database first. On wp-vps, after
+copying a new `errex-release`:
+
+```bash
+cd ~/errex-release && sha256sum -c errexd.sha256
+sudo install -m 0755 errexd /usr/local/bin/errexd.new
+
+# Rehearse the migration on an online copy (the live file is not touched).
+sudo install -d -m 0750 -o errex -g errex /var/lib/errex-rehearsal
+sudo -u errex sqlite3 /var/lib/errex/errex.db ".backup '/var/lib/errex-rehearsal/errex.db'"
+sudo -u errex env ERREX_DATA_DIR=/var/lib/errex-rehearsal /usr/local/bin/errexd.new project list >/dev/null
+for db in errex errex-rehearsal; do
+  sudo -u errex sqlite3 /var/lib/$db/errex.db \
+    'SELECT (SELECT COUNT(*) FROM issues), (SELECT COUNT(*) FROM events);'
+done                                     # the rehearsal keeps every issue and event
+sudo rm -rf /var/lib/errex-rehearsal
+
+# Back up, keep the old binary beside the new one, switch.
+sudo systemctl start errex-backup.service && ls -lt /var/backups/errex | head -2
+sudo cp -p /usr/local/bin/errexd /usr/local/bin/errexd.prev
+sudo mv /usr/local/bin/errexd.new /usr/local/bin/errexd
+sudo systemctl restart errexd
+systemctl is-active errexd && curl -sg 'http://[::1]:9090/health'
+journalctl -u errexd -n 20 --no-pager
+```
+
+**Roll back:** a binary refuses to start on a database migrated past what
+it knows, so going back to `errexd.prev` takes the schema with it. With
+errexd stopped, either run the migration's script from `rollback/`, which
+keeps every issue and event including those received since the upgrade:
+
+```bash
+sudo systemctl stop errexd
+sudo -u errex sqlite3 /var/lib/errex/errex.db < ~/errex-deploy/rollback/<version>_<name>.sql
+sudo cp -p /usr/local/bin/errexd.prev /usr/local/bin/errexd
+sudo systemctl start errexd
+```
+
+or restore the backup taken before the switch (below), which also loses
+what arrived since.
 
 **Restore:** `sudo systemctl stop errexd`, `gunzip -c
 /var/backups/errex/errex-<stamp>.db.gz | sudo -u errex tee
