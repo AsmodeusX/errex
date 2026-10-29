@@ -21,7 +21,13 @@
 //!
 //! `extra.dart_stack` is a machine trace whose build id and offsets are hex
 //! by nature; it keeps the VIN, e-mail and token rules but not the hex and
-//! base64 ones, or offline symbolication would have nothing to read.
+//! base64 ones, or offline symbolication would have nothing to read. The
+//! Zeus app's `ecu_reset` event is the same kind of record: the ECU's reset
+//! record decoded and raw (`extra.reset_record`, `reset_record_raw`,
+//! `reset_details_raw`) and four tags that are one hex number each (the
+//! cause code, the loader's reset type, the cause detail and the code
+//! address in the ECU software, `reset.*`). The app checks those values by
+//! shape before it sends them.
 
 use errex_proto::Event;
 use serde_json::{Map, Value};
@@ -55,7 +61,23 @@ const FORBIDDEN: &[&str] = &[
 ];
 
 /// `extra` keys holding a machine trace: see the module comment.
-const TRACE_KEYS: &[&str] = &["dart_stack"];
+const TRACE_KEYS: &[&str] = &[
+    "dart_stack",
+    "reset_record",
+    "reset_record_raw",
+    "reset_details_raw",
+];
+
+/// Tags whose value is one machine hex number: see the module comment.
+const TRACE_TAGS: &[&str] = &["reset.cause_code", "reset.tag", "reset.info", "reset.where"];
+
+fn tag_mode(key: &str) -> Mode {
+    if TRACE_TAGS.contains(&key) {
+        Mode::Trace
+    } else {
+        Mode::Full
+    }
+}
 
 fn is_forbidden(key: &str) -> bool {
     FORBIDDEN.iter().any(|f| f.eq_ignore_ascii_case(key))
@@ -149,7 +171,12 @@ pub fn scrub_strings(list: &mut [String]) {
 
 fn scrub_tags(v: &mut Value) {
     match v {
-        Value::Object(map) => scrub_map(map, Mode::Full),
+        Value::Object(map) => {
+            map.retain(|k, _| !is_forbidden(k));
+            for (k, value) in map.iter_mut() {
+                scrub_value(value, tag_mode(k));
+            }
+        }
         Value::Array(pairs) => {
             pairs.retain(
                 |pair| !matches!(pair.get(0).and_then(Value::as_str), Some(k) if is_forbidden(k)),
@@ -157,8 +184,9 @@ fn scrub_tags(v: &mut Value) {
             for pair in pairs.iter_mut() {
                 match pair {
                     Value::Array(kv) if kv.len() >= 2 => {
+                        let mode = kv[0].as_str().map_or(Mode::Full, tag_mode);
                         for value in kv.iter_mut().skip(1) {
-                            scrub_value(value, Mode::Full);
+                            scrub_value(value, mode);
                         }
                     }
                     other => scrub_value(other, Mode::Full),
@@ -576,6 +604,69 @@ mod tests {
         let extra = e.extra.unwrap();
         assert_eq!(extra["dart_stack"], json!(stack));
         assert_eq!(extra["other"], json!("<hex>"));
+    }
+
+    #[test]
+    fn ecu_reset_record_keeps_its_hex() {
+        // The Zeus app's ecu_reset event: the record's addresses and raw
+        // replies are what pinpoints the reset.
+        // The app sends raw replies as spaced bytes: a long digit-only run
+        // would meet the VIN rule, which holds here too.
+        let raw = "71 c2 00 01 05 00 05 08 18 00 0a 00 00 40 40 00";
+        let mut e = ev(json!({
+            "tags": {
+                "reset.where": "0x801a678e",
+                "reset.info": "0x00010006",
+                "reset.cause_code": "0x20",
+                "reset.tag": "0x44",
+                "reset.cause": "TRAP",
+                "ecu.software": "0x801a678e",
+            },
+            "extra": {
+                "reset_record": { "entries": [{ "where": "0x801a678e", "note": "WBS8M9C50J5K12345" }] },
+                "reset_record_raw": raw,
+                "reset_details_raw": [raw, null],
+                "flash": { "addr": "0x801a678e" },
+            },
+        }));
+        scrub_event(&mut e);
+        assert_eq!(
+            e.tags,
+            Some(json!({
+                "reset.where": "0x801a678e",
+                "reset.info": "0x00010006",
+                "reset.cause_code": "0x20",
+                "reset.tag": "0x44",
+                "reset.cause": "TRAP",
+                "ecu.software": "<hex>",
+            }))
+        );
+        let extra = e.extra.unwrap();
+        assert_eq!(
+            extra["reset_record"]["entries"][0]["where"],
+            json!("0x801a678e")
+        );
+        // The VIN rule still holds inside the record.
+        assert_eq!(extra["reset_record"]["entries"][0]["note"], json!("<vin>"));
+        assert_eq!(extra["reset_record_raw"], json!(raw));
+        assert_eq!(extra["reset_details_raw"], json!([raw, null]));
+        assert_eq!(extra["flash"]["addr"], json!("<hex>"));
+    }
+
+    #[test]
+    fn ecu_reset_tag_pairs_keep_their_hex() {
+        let mut e = ev(json!({
+            "tags": [["reset.where", "0x801a678e"], ["x", "0x801a678e"], ["reset.where2", "deadbeef00"]],
+        }));
+        scrub_event(&mut e);
+        assert_eq!(
+            e.tags,
+            Some(json!([
+                ["reset.where", "0x801a678e"],
+                ["x", "<hex>"],
+                ["reset.where2", "<hex>"]
+            ]))
+        );
     }
 
     #[test]
