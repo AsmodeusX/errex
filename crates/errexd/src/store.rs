@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::path::Path;
 
 use chrono::{DateTime, Utc};
@@ -216,6 +217,58 @@ macro_rules! issue_columns {
         "id, project, fingerprint, title, culprit, level, status, event_count, first_seen, \
          last_seen, first_release, last_release, newest_release, resolved_in_release"
     };
+}
+
+/// The latest stored event's `tags`, as JSON text, for an `issues` query:
+/// what [`Issue::tags`] is read from. A payload that is not JSON yields NULL
+/// rather than failing the whole list.
+macro_rules! latest_tags_column {
+    () => {
+        "(SELECT CASE WHEN json_valid(e.payload) THEN json_extract(e.payload, '$.tags') END \
+         FROM events e WHERE e.issue_id = issues.id \
+         ORDER BY e.received_at DESC, e.id DESC LIMIT 1) AS latest_tags"
+    };
+}
+
+/// Most tags [`tag_summary`] keeps for one issue.
+pub const SUMMARY_TAGS_MAX: usize = 32;
+/// Longest tag key, in characters, [`tag_summary`] keeps.
+pub const SUMMARY_TAG_KEY_MAX: usize = 64;
+/// Longest tag value, in characters, [`tag_summary`] keeps.
+pub const SUMMARY_TAG_VALUE_MAX: usize = 200;
+
+/// An event's `tags` (object or `[key, value]` pairs) as the bounded
+/// string map [`Issue::tags`] carries. Strings, numbers and booleans are
+/// kept; nulls and structures are not tags and are skipped. None when
+/// nothing is left.
+pub fn tag_summary(tags: &serde_json::Value) -> Option<BTreeMap<String, String>> {
+    use serde_json::Value;
+    let pairs: Vec<(&str, &Value)> = match tags {
+        Value::Object(map) => map.iter().map(|(k, v)| (k.as_str(), v)).collect(),
+        Value::Array(pairs) => pairs
+            .iter()
+            .filter_map(|pair| {
+                let pair = pair.as_array()?;
+                Some((pair.first()?.as_str()?, pair.get(1)?))
+            })
+            .collect(),
+        _ => return None,
+    };
+    let cap = |s: &str, max: usize| s.chars().take(max).collect::<String>();
+    let mut out = BTreeMap::new();
+    for (key, value) in pairs {
+        if out.len() == SUMMARY_TAGS_MAX {
+            break;
+        }
+        let value = match value {
+            Value::String(s) => cap(s, SUMMARY_TAG_VALUE_MAX),
+            Value::Number(n) => n.to_string(),
+            Value::Bool(b) => b.to_string(),
+            _ => continue,
+        };
+        out.insert(cap(key, SUMMARY_TAG_KEY_MAX), value);
+    }
+    (!out.is_empty()).then_some(out)
 }
 
 /// A persisted event with its raw payload kept verbatim. The renderer can
@@ -692,12 +745,20 @@ impl Store {
             (IssueStatus::Resolved, None) => newest_project_release(&mut tx, &project).await?,
             _ => None,
         };
-        let row: IssueRow = sqlx::query_as(concat!(
+        let mut row: IssueRow = sqlx::query_as(concat!(
             "UPDATE issues SET status = ?, resolved_in_release = ? WHERE id = ? RETURNING ",
             issue_columns!()
         ))
         .bind(status.as_db_str())
         .bind(resolved_in)
+        .bind(issue_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        row.latest_tags = sqlx::query_scalar(concat!(
+            "SELECT ",
+            latest_tags_column!(),
+            " FROM issues WHERE id = ?"
+        ))
         .bind(issue_id)
         .fetch_one(&mut *tx)
         .await?;
@@ -783,12 +844,13 @@ impl Store {
     /// Load every issue, newest-first by `last_seen`. Used by the WS snapshot
     /// and the `/api/issues` endpoint when no project filter is applied.
     pub async fn load_issues(&self) -> Result<Vec<Issue>, DaemonError> {
-        let rows: Vec<IssueRow> = sqlx::query_as(
+        let rows: Vec<IssueRow> = sqlx::query_as(concat!(
             "SELECT id, project, fingerprint, title, culprit, level, status, \
              event_count, first_seen, last_seen, \
-             first_release, last_release, newest_release, resolved_in_release \
-             FROM issues ORDER BY last_seen DESC LIMIT ?",
-        )
+             first_release, last_release, newest_release, resolved_in_release, ",
+            latest_tags_column!(),
+            " FROM issues ORDER BY last_seen DESC LIMIT ?"
+        ))
         .bind(ISSUE_LIST_LIMIT)
         .fetch_all(&self.pool)
         .await?;
@@ -797,12 +859,13 @@ impl Store {
 
     /// Issues for a single project, newest-first.
     pub async fn list_issues_by_project(&self, project: &str) -> Result<Vec<Issue>, DaemonError> {
-        let rows: Vec<IssueRow> = sqlx::query_as(
+        let rows: Vec<IssueRow> = sqlx::query_as(concat!(
             "SELECT id, project, fingerprint, title, culprit, level, status, \
              event_count, first_seen, last_seen, \
-             first_release, last_release, newest_release, resolved_in_release \
-             FROM issues WHERE project = ? ORDER BY last_seen DESC LIMIT ?",
-        )
+             first_release, last_release, newest_release, resolved_in_release, ",
+            latest_tags_column!(),
+            " FROM issues WHERE project = ? ORDER BY last_seen DESC LIMIT ?"
+        ))
         .bind(project)
         .bind(ISSUE_LIST_LIMIT)
         .fetch_all(&self.pool)
@@ -1872,6 +1935,9 @@ struct IssueRow {
     last_release: Option<String>,
     newest_release: Option<String>,
     resolved_in_release: Option<String>,
+    /// [`latest_tags_column`]: only the list and status queries select it.
+    #[sqlx(default)]
+    latest_tags: Option<String>,
 }
 
 impl From<IssueRow> for Issue {
@@ -1898,6 +1964,10 @@ impl From<IssueRow> for Issue {
             last_release: r.last_release,
             newest_release: r.newest_release,
             resolved_in_release: r.resolved_in_release,
+            tags: r
+                .latest_tags
+                .and_then(|t| serde_json::from_str(&t).ok())
+                .and_then(|t| tag_summary(&t)),
         }
     }
 }

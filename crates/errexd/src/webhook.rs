@@ -424,6 +424,7 @@ mod tests {
             last_release: None,
             newest_release: None,
             resolved_in_release: None,
+            tags: None,
         }
     }
 

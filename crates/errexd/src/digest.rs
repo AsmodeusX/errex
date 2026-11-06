@@ -54,6 +54,9 @@ pub struct IngestEvent {
     pub release: Option<String>,
     /// The event matched the paging rule ([`pages`]).
     pub page: bool,
+    /// The event's tags as the issue carries them on the wire
+    /// ([`crate::store::tag_summary`]): this event is the issue's latest.
+    pub tags: Option<std::collections::BTreeMap<String, String>>,
     /// This event's share of the ingest memory budget. Released when the
     /// digest task drops the record after persisting it.
     pub _budget: Option<std::sync::Arc<tokio::sync::OwnedSemaphorePermit>>,
@@ -199,6 +202,7 @@ pub fn prepare(project: String, mut event: Event) -> IngestEvent {
         crate::scrub::scrub_strings(list);
     }
     let page = pages(&event);
+    let tags = event.tags.as_ref().and_then(crate::store::tag_summary);
     let release = event
         .release
         .clone()
@@ -252,6 +256,7 @@ pub fn prepare(project: String, mut event: Event) -> IngestEvent {
         payload,
         release,
         page,
+        tags,
         _budget: None,
     }
 }
@@ -341,7 +346,8 @@ async fn process_batch(
         }
     };
 
-    for (rec, result) in buf.iter().zip(results) {
+    for (rec, mut result) in buf.iter().zip(results) {
+        result.issue.tags = rec.tags.clone();
         if result.regressed {
             tracing::warn!(
                 project = %rec.project,

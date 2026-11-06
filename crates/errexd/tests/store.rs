@@ -2793,3 +2793,115 @@ async fn releases_migration_backfills_a_database_the_previous_daemon_wrote() {
         "a release first reported after the back-filled ones"
     );
 }
+
+// ----- latest-event tags on the issue -----
+
+async fn tagged_event(
+    store: &Store,
+    fp: &str,
+    payload: serde_json::Value,
+    at: chrono::DateTime<Utc>,
+) {
+    let f = Fingerprint::new(fp.to_string());
+    let id = Uuid::new_v4().simple().to_string();
+    let payload = payload.to_string();
+    store
+        .upsert_batch_with_events(&[BatchUpsertInput {
+            project: "p",
+            fp: &f,
+            title: "T",
+            culprit: None,
+            level: Some("error"),
+            now: at,
+            event_id: &id,
+            payload: &payload,
+            release: None,
+        }])
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn issues_carry_the_tags_of_their_latest_event() {
+    use serde_json::json;
+    let (store, _dir) = fresh_store().await;
+    let t = Utc::now();
+    tagged_event(
+        &store,
+        "tagged",
+        json!({ "tags": { "error.code": "old" } }),
+        t,
+    )
+    .await;
+    // Pair form, a number, a null: the SDK shapes errex already accepts.
+    tagged_event(
+        &store,
+        "tagged",
+        json!({ "tags": [["error.code", "state_error"], ["error.context", "flash_plan"],
+                         ["logging.channels", 40], ["gone", null]] }),
+        t + Duration::seconds(1),
+    )
+    .await;
+    tagged_event(&store, "untagged", json!({ "message": "m" }), t).await;
+
+    let want: std::collections::BTreeMap<String, String> = [
+        ("error.code", "state_error"),
+        ("error.context", "flash_plan"),
+        ("logging.channels", "40"),
+    ]
+    .into_iter()
+    .map(|(k, v)| (k.to_string(), v.to_string()))
+    .collect();
+
+    for issues in [
+        store.list_issues_by_project("p").await.unwrap(),
+        store.load_issues().await.unwrap(),
+    ] {
+        let tagged = issues
+            .iter()
+            .find(|i| i.fingerprint.as_str() == "tagged")
+            .unwrap();
+        assert_eq!(tagged.tags.as_ref(), Some(&want));
+        let untagged = issues
+            .iter()
+            .find(|i| i.fingerprint.as_str() == "untagged")
+            .unwrap();
+        assert_eq!(untagged.tags, None);
+    }
+
+    let tagged = store.list_issues_by_project("p").await.unwrap();
+    let tagged = tagged
+        .iter()
+        .find(|i| i.fingerprint.as_str() == "tagged")
+        .unwrap();
+    let resolved = store
+        .set_status(tagged.id, IssueStatus::Resolved, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        resolved.tags.as_ref(),
+        Some(&want),
+        "a status change keeps them"
+    );
+}
+
+#[test]
+fn tag_summary_is_bounded() {
+    use serde_json::json;
+    let mut many = serde_json::Map::new();
+    for i in 0..100 {
+        many.insert(format!("k{i:03}"), json!("v"));
+    }
+    many.insert("long".into(), json!("x".repeat(1000)));
+    many.insert("k".repeat(100), json!("v"));
+    let got = store::tag_summary(&serde_json::Value::Object(many)).unwrap();
+    assert_eq!(got.len(), store::SUMMARY_TAGS_MAX);
+    assert!(got
+        .keys()
+        .all(|k| k.chars().count() <= store::SUMMARY_TAG_KEY_MAX));
+    assert!(got
+        .values()
+        .all(|v| v.chars().count() <= store::SUMMARY_TAG_VALUE_MAX));
+    assert_eq!(store::tag_summary(&json!({})), None);
+    assert_eq!(store::tag_summary(&json!("not tags")), None);
+}

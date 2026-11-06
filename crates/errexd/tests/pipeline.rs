@@ -394,3 +394,20 @@ async fn alerts_fire_once_per_issue_per_release() {
     p.wait_for_events(9).await;
     assert!(p.alerts.try_recv().is_err(), "regressed once");
 }
+
+#[tokio::test]
+async fn the_issue_on_the_wire_carries_its_latest_events_tags() {
+    let mut p = pipeline().await;
+    p.ingest(json!({
+        "level": "error",
+        "fingerprint": ["caught", "flash_plan", "state_error"],
+        "exception": { "values": [{ "type": "state_error", "value": "bad state" }] },
+        "tags": { "error.code": "state_error", "error.context": "flash_plan", "x": "0x80040000" }
+    }))
+    .await;
+    let t = p.next_alert().await;
+    let tags = t.issue.tags.expect("tags on the alerted issue");
+    assert_eq!(tags["error.code"], "state_error");
+    assert_eq!(tags["error.context"], "flash_plan");
+    assert_eq!(tags["x"], "<hex>", "the issue's tags are the scrubbed ones");
+}

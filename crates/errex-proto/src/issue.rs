@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
@@ -77,4 +79,9 @@ pub struct Issue {
     /// release or an older one count without regressing the issue.
     #[serde(default)]
     pub resolved_in_release: Option<String>,
+    /// Tags of the issue's most recent event, as strings and bounded in
+    /// count and length, so the list can show and filter on them. Absent
+    /// when the issue has no stored event or the event had no tags.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tags: Option<BTreeMap<String, String>>,
 }

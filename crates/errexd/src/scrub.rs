@@ -21,7 +21,10 @@
 //!
 //! `extra.dart_stack` is a machine trace whose build id and offsets are hex
 //! by nature; it keeps the VIN, e-mail and token rules but not the hex and
-//! base64 ones, or offline symbolication would have nothing to read.
+//! base64 ones, or offline symbolication would have nothing to read. The
+//! same holds for `extra.build_id`, the id that picks the symbols file, and
+//! for the `dart_stack` of each entry of `extra.causes` (the outer-to-inner
+//! chain of wrapped errors); the rest of a cause keeps every rule.
 
 use errex_proto::Event;
 use serde_json::{Map, Value};
@@ -55,7 +58,10 @@ const FORBIDDEN: &[&str] = &[
 ];
 
 /// `extra` keys holding a machine trace: see the module comment.
-const TRACE_KEYS: &[&str] = &["dart_stack"];
+const TRACE_KEYS: &[&str] = &["dart_stack", "build_id"];
+
+/// `extra` key holding a list of causes, each with its own trace.
+const CAUSES_KEY: &str = "causes";
 
 fn is_forbidden(key: &str) -> bool {
     FORBIDDEN.iter().any(|f| f.eq_ignore_ascii_case(key))
@@ -125,12 +131,13 @@ pub fn scrub_event(ev: &mut Event) {
     if let Some(Value::Object(extra)) = ev.extra.as_mut() {
         extra.retain(|k, _| !is_forbidden(k));
         for (k, v) in extra.iter_mut() {
-            let mode = if TRACE_KEYS.contains(&k.as_str()) {
-                Mode::Trace
+            if TRACE_KEYS.contains(&k.as_str()) {
+                scrub_value(v, Mode::Trace);
+            } else if k == CAUSES_KEY {
+                scrub_causes(v);
             } else {
-                Mode::Full
-            };
-            scrub_value(v, mode);
+                scrub_value(v, Mode::Full);
+            }
         }
     } else if let Some(v) = ev.extra.as_mut() {
         scrub_value(v, Mode::Full);
@@ -166,6 +173,31 @@ fn scrub_tags(v: &mut Value) {
             }
         }
         other => scrub_value(other, Mode::Full),
+    }
+}
+
+/// `extra.causes`: each entry's `dart_stack` is a trace, everything else
+/// gets every rule. Anything but a list of objects is not a cause chain and
+/// is scrubbed like any other value.
+fn scrub_causes(v: &mut Value) {
+    let Value::Array(entries) = v else {
+        return scrub_value(v, Mode::Full);
+    };
+    for entry in entries {
+        match entry {
+            Value::Object(fields) => {
+                fields.retain(|k, _| !is_forbidden(k));
+                for (k, field) in fields.iter_mut() {
+                    let mode = if k == "dart_stack" {
+                        Mode::Trace
+                    } else {
+                        Mode::Full
+                    };
+                    scrub_value(field, mode);
+                }
+            }
+            other => scrub_value(other, Mode::Full),
+        }
     }
 }
 
@@ -576,6 +608,47 @@ mod tests {
         let extra = e.extra.unwrap();
         assert_eq!(extra["dart_stack"], json!(stack));
         assert_eq!(extra["other"], json!("<hex>"));
+    }
+
+    #[test]
+    fn build_id_and_cause_stacks_keep_their_hex() {
+        // `extra.build_id` names the symbols file; each cause carries its own
+        // non-symbolic trace. Both are read by offline symbolication.
+        let stack = "build_id: '0f3a5b7c9d1e2f3a4152c37485e60718'\n\
+                     #00 abs 000000750a2f5c1f virt 00000000002f5c1f _kDartIsolateSnapshotInstructions+0x2f5c1f";
+        let mut e = ev(json!({ "extra": {
+            "build_id": "0f3a5b7c9d1e2f3a4152c37485e60718",
+            "causes": [
+                { "type": "flash_failure", "message": "at 0x80040000", "dart_stack": stack },
+                { "type": "host_refusal", "message": "host_refusal",
+                  "dart_stack": format!("{stack}\nWBS8M9C50J5K12345"), "zfl": "x" },
+                "0x12345678",
+            ],
+        }}));
+        scrub_event(&mut e);
+        let extra = e.extra.unwrap();
+        assert_eq!(extra["build_id"], json!("0f3a5b7c9d1e2f3a4152c37485e60718"));
+        let causes = &extra["causes"];
+        assert_eq!(causes[0]["dart_stack"], json!(stack));
+        // Only the stack is a trace: the rest of a cause keeps every rule.
+        assert_eq!(causes[0]["message"], json!("at <hex>"));
+        assert_eq!(
+            causes[1]["dart_stack"],
+            json!(format!("{stack}\n<vin>")),
+            "the VIN rule holds inside a cause's stack"
+        );
+        assert!(causes[1].get("zfl").is_none(), "forbidden keys are dropped");
+        assert_eq!(causes[2], json!("<hex>"));
+    }
+
+    #[test]
+    fn causes_that_are_not_a_list_get_every_rule() {
+        let mut e = ev(json!({ "extra": { "causes": { "dart_stack": "at 0x80040000" } } }));
+        scrub_event(&mut e);
+        assert_eq!(
+            e.extra.unwrap()["causes"],
+            json!({ "dart_stack": "at <hex>" })
+        );
     }
 
     #[test]

@@ -264,6 +264,7 @@ fn issue_round_trips_through_json() {
         last_release: None,
         newest_release: None,
         resolved_in_release: None,
+        tags: None,
     };
     let v = serde_json::to_value(&issue).unwrap();
     // Names the SPA reads must be exactly these.
@@ -318,6 +319,38 @@ fn issue_release_fields_round_trip_and_default_when_absent() {
         Some("zeus-suite@0.0.15+12")
     );
     assert_eq!(round.first_release.as_deref(), Some("zeus-suite@0.0.14+11"));
+}
+
+#[test]
+fn issue_tags_round_trip_and_stay_off_the_wire_when_unknown() {
+    let mut issue: Issue = serde_json::from_value(json!({
+        "id": 1, "project": "p", "fingerprint": "fp", "title": "t",
+        "culprit": null, "level": null, "status": "unresolved", "event_count": 1,
+        "first_seen": "2026-01-01T00:00:00Z", "last_seen": "2026-01-01T00:00:00Z"
+    }))
+    .expect("a payload from an older daemon still parses");
+    assert_eq!(issue.tags, None);
+    assert!(
+        serde_json::to_value(&issue).unwrap().get("tags").is_none(),
+        "no tags key when the latest event's tags are unknown"
+    );
+
+    issue.tags = Some(
+        [
+            ("error.code", "state_error"),
+            ("error.context", "flash_plan"),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect(),
+    );
+    let v = serde_json::to_value(&issue).unwrap();
+    assert_eq!(
+        v["tags"],
+        json!({ "error.code": "state_error", "error.context": "flash_plan" })
+    );
+    let round: Issue = serde_json::from_value(v).unwrap();
+    assert_eq!(round.tags, issue.tags);
 }
 
 #[test]
@@ -410,6 +443,7 @@ fn server_message_issue_created_and_updated_use_distinct_tags() {
         last_release: None,
         newest_release: None,
         resolved_in_release: None,
+        tags: None,
     };
     let created = serde_json::to_value(ServerMessage::IssueCreated {
         issue: issue.clone(),
