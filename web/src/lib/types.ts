@@ -37,6 +37,9 @@ export interface Issue {
   /** While resolved: events from this release or older count without
    *  regressing the issue. */
   resolved_in_release?: string | null;
+  /** Tags of the issue's most recent event, bounded by the daemon; absent
+   *  when it has none. Drives the list's code/context line and `tag:`. */
+  tags?: Record<string, string> | null;
 }
 
 /** One release that reported an issue (`GET /api/issues/:id/releases`). */
@@ -116,6 +119,8 @@ export interface Breadcrumb {
   level?: IssueLevel | null;
   message?: string | null;
   type?: string | null;
+  /** Structured fields of the crumb (`page`, `action`, `endpoint`, ...). */
+  data?: Record<string, unknown> | null;
 }
 
 /** Sentry's envelope-event payload, as preserved by errexd. */

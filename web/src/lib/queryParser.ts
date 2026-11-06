@@ -297,8 +297,9 @@ export function tokenize(input: string): Token[] {
       }
     }
 
-    // tag:KEY:VAL[,VAL] / tag:VALUE (loose)
-    const tagRe = /^tag\s*:\s*([\w-]+)(?:\s*:\s*([\w*-]+(?:,[\w*-]+)*))?/i;
+    // tag:KEY:VAL[,VAL] / tag:VALUE (loose). Keys and values may hold dots
+    // (`error.code`, `1.0.11`).
+    const tagRe = /^tag\s*:\s*([\w.-]+)(?:\s*:\s*([\w.*-]+(?:,[\w.*-]+)*))?/i;
     const tagM = tagRe.exec(input.slice(i));
     if (tagM) {
       const span: [number, number] = [i, i + tagM[0].length];

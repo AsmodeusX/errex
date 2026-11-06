@@ -19,6 +19,7 @@ function freshFilter(): FilterStore {
     limit: null,
     newOnly: false,
     staleOnly: false,
+    tags: [],
     toggleStatus() {},
     toggleLevel() {}
   } as unknown as FilterStore;
@@ -181,5 +182,26 @@ describe('Query (low-level) → filter mapping', () => {
     expect(f.levels.has('debug')).toBe(false);
     expect(f.levels.has('fatal')).toBe(true);
     expect(f.levels.size).toBe(4); // every level except debug
+  });
+});
+
+describe('tag filters', () => {
+  it('writes tag filters and reads them back', () => {
+    const f = freshFilter();
+    applyInputToFilter('tag:error.context:flash_plan,licence tag:state_error timeout', f);
+    expect(f.tags).toEqual([
+      { key: 'error.context', values: ['flash_plan', 'licence'] },
+      { key: null, values: ['state_error'] }
+    ]);
+    expect(f.query).toBe('timeout');
+    expect(filterToQueryString(f)).toBe('tag:error.context:flash_plan,licence tag:state_error timeout');
+  });
+
+  it('clears tag filters the input no longer names', () => {
+    const f = freshFilter();
+    applyInputToFilter('tag:error.code:format', f);
+    applyInputToFilter('fatal', f);
+    expect(f.tags).toEqual([]);
+    expect(filterToQueryString(f)).toBe('fatal');
   });
 });

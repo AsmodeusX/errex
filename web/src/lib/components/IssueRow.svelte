@@ -5,6 +5,7 @@
   import { Button } from '$lib/components/ui/button';
   import * as Tooltip from '$lib/components/ui/tooltip';
   import { eventStream } from '$lib/eventStream.svelte';
+  import { issueSummaryTags } from '$lib/issueTags';
   import { toggleIgnore, toggleResolve } from '$lib/issueOps';
   import { toast } from '$lib/toast.svelte';
   import type { Issue } from '$lib/types';
@@ -81,6 +82,9 @@
     };
   });
   const truncatedFile = $derived(subtitleParts?.file ? midTruncatePath(subtitleParts.file, 40) : '');
+  // The latest event's error code and context, so a list of app issues
+  // (which carry no frames, hence no culprit) still says what failed where.
+  const summaryTags = $derived(issueSummaryTags(issue.tags));
 
   function activate() {
     onSelect?.(issue.id);
@@ -210,16 +214,30 @@
     <span class="truncate text-foreground">{issue.title}</span>
   </div>
 
-  <!-- Col 2 / Row 2 — subtitle: function in fg/70, path in muted -->
-  {#if subtitleParts}
+  <!-- Col 2 / Row 2 — subtitle: function in fg/70, path in muted, then
+       the latest event's error code and context -->
+  {#if subtitleParts || summaryTags.length > 0}
     <div
-      class="col-start-2 row-start-2 flex min-w-0 items-baseline self-start pt-1 text-[11px] leading-none"
+      class="col-start-2 row-start-2 flex min-w-0 items-baseline gap-1.5 self-start pt-1 text-[11px] leading-none"
     >
-      {#if subtitleParts.fn}
-        <span class="max-w-[40%] shrink-0 truncate text-foreground/70">{subtitleParts.fn}</span>
-        <span aria-hidden="true" class="mx-1 shrink-0 text-muted-foreground/40">·</span>
+      {#if subtitleParts}
+        <span class="flex min-w-0 flex-1 items-baseline">
+          {#if subtitleParts.fn}
+            <span class="max-w-[40%] shrink-0 truncate text-foreground/70">{subtitleParts.fn}</span>
+            <span aria-hidden="true" class="mx-1 shrink-0 text-muted-foreground/40">·</span>
+          {/if}
+          <span class="min-w-0 flex-1 truncate text-muted-foreground">{truncatedFile}</span>
+        </span>
       {/if}
-      <span class="min-w-0 flex-1 truncate text-muted-foreground">{truncatedFile}</span>
+      {#each summaryTags as [k, v] (k)}
+        <Badge
+          variant="outline"
+          class="max-w-[45%] shrink truncate rounded-sm px-1 py-0 text-[10px] leading-4"
+          title={`${k}=${v}`}
+        >
+          <span class="text-muted-foreground">{k === 'error.code' ? 'code' : 'context'}</span>&nbsp;{v}
+        </Badge>
+      {/each}
     </div>
   {/if}
 

@@ -1,3 +1,5 @@
+import { matchesTagFilters } from './issueTags';
+import type { TagFilter } from './queryParser';
 import type {
   ConnectionStatus,
   Issue,
@@ -66,6 +68,9 @@ export class FilterStore {
   // Inverse: issues that have gone quiet — last_seen older than 24h and
   // status still unresolved. Driven by `stale` / `old` keywords.
   staleOnly = $state(false);
+  // `tag:` tokens: every filter must hold on the issue's latest-event tags
+  // (`Issue.tags`). Empty = no tag filter.
+  tags = $state<TagFilter[]>([]);
 
   toggleStatus(s: IssueStatus) {
     const next = new Set(this.statuses);
@@ -217,6 +222,7 @@ export function visibleIssues(opts: VisibleIssuesOpts = {}): Issue[] {
     if (filter.spikingOnly) {
       if (!opts.isSpiking || !opts.isSpiking(i.id)) return false;
     }
+    if (!matchesTagFilters(i.tags, filter.tags)) return false;
     if (!matches(i, parsed)) return false;
     return true;
   });

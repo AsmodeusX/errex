@@ -37,6 +37,7 @@ beforeEach(() => {
   filter.sinceMs = null;
   filter.spikingOnly = false;
   filter.sort = 'recent';
+  filter.tags = [];
   projects.current = 'p';
   selection.issueId = null;
   selection.event = null;
@@ -347,5 +348,21 @@ describe('visibleIssues + regex query', () => {
     ]);
     filter.query = 'cafe';
     expect(visibleIssues().map((i) => i.id)).toEqual([1]);
+  });
+});
+
+describe('visibleIssues — tag filters', () => {
+  it('keeps the issues whose latest event carries the tag', () => {
+    issues.reset([
+      issue({ id: 1, tags: { 'error.code': 'state_error', 'error.context': 'flash_plan' } }),
+      issue({ id: 2, tags: { 'error.code': 'format', 'error.context': 'licence' } }),
+      issue({ id: 3 })
+    ]);
+    filter.tags = [{ key: 'error.context', values: ['flash_plan'] }];
+    expect(visibleIssues().map((i) => i.id)).toEqual([1]);
+    filter.tags = [{ key: null, values: ['format'] }];
+    expect(visibleIssues().map((i) => i.id)).toEqual([2]);
+    filter.tags = [];
+    expect(visibleIssues().map((i) => i.id).sort()).toEqual([1, 2, 3]);
   });
 });

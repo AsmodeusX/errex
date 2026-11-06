@@ -26,6 +26,7 @@ beforeEach(() => {
   filter.newOnly = false;
   filter.staleOnly = false;
   filter.limit = null;
+  filter.tags = [];
   projects.current = 'p';
   load.initialLoad = false;
 });
@@ -63,5 +64,55 @@ describe('IssueList active-filter readout', () => {
       filter.query = 'auth';
     });
     expect(await screen.findByText('Clear all')).toBeInTheDocument();
+  });
+});
+
+describe('IssueList rows and tag filters', () => {
+  function seed() {
+    issues.reset([
+      {
+        id: 1,
+        project: 'p',
+        fingerprint: 'a',
+        title: 'state_error: bad state',
+        culprit: null,
+        level: 'error',
+        status: 'unresolved',
+        event_count: 1,
+        first_seen: '2026-01-01T00:00:00Z',
+        last_seen: '2026-01-01T00:00:00Z',
+        tags: { 'error.code': 'state_error', 'error.context': 'flash_plan' }
+      },
+      {
+        id: 2,
+        project: 'p',
+        fingerprint: 'b',
+        title: 'format: bad input',
+        culprit: null,
+        level: 'warning',
+        status: 'unresolved',
+        event_count: 1,
+        first_seen: '2026-01-01T00:00:00Z',
+        last_seen: '2026-01-01T00:00:01Z',
+        tags: { 'error.code': 'format', 'error.context': 'licence' }
+      }
+    ]);
+  }
+
+  it('shows the latest event\'s error code and context on each row', () => {
+    seed();
+    render(IssueListWrapper);
+    expect(screen.getByTitle('error.code=state_error')).toHaveTextContent('code state_error');
+    expect(screen.getByTitle('error.context=licence')).toHaveTextContent('context licence');
+  });
+
+  it('keeps only the issues a tag filter matches', async () => {
+    seed();
+    render(IssueListWrapper);
+    flushSync(() => {
+      filter.tags = [{ key: 'error.context', values: ['licence'] }];
+    });
+    expect(screen.queryByText('state_error: bad state')).toBeNull();
+    expect(screen.getByText('format: bad input')).toBeInTheDocument();
   });
 });

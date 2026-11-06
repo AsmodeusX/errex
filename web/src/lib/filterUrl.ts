@@ -2,6 +2,7 @@
 // active filter is shareable, reload-safe, and bookmarkable. Defaults
 // are omitted from the query string to keep clean URLs the common case.
 
+import type { TagFilter } from './queryParser';
 import type { IssueLevel, IssueStatus, SortKey } from './types';
 
 export interface FilterState {
@@ -14,6 +15,25 @@ export interface FilterState {
   /** Maximum number of issues to surface; null = no cap. Driven by `top N`
    *  / `limit:N` tokens in the unified input. */
   limit?: number | null;
+  /** `tag:` filters, one `tag` param each (`key:v1,v2`, or `v` without a key). */
+  tags?: TagFilter[];
+}
+
+// The characters a `tag:` token accepts (queryParser), so a URL cannot
+// carry a filter the input could not show.
+const TAG_KEY = /^[\w.-]+$/;
+const TAG_VALUE = /^[\w.*-]+$/;
+
+function parseTagParam(raw: string): TagFilter | null {
+  const colon = raw.indexOf(':');
+  const key = colon === -1 ? null : raw.slice(0, colon).toLowerCase();
+  const values = (colon === -1 ? raw : raw.slice(colon + 1))
+    .split(',')
+    .map((v) => v.trim().toLowerCase())
+    .filter(Boolean);
+  if (values.length === 0 || !values.every((v) => TAG_VALUE.test(v))) return null;
+  if (key !== null && !TAG_KEY.test(key)) return null;
+  return { key, values };
 }
 
 const ALL_STATUSES: IssueStatus[] = ['unresolved', 'resolved', 'muted', 'ignored'];
@@ -60,6 +80,9 @@ export function serializeFilterParams(f: FilterState): URLSearchParams {
   // Limit is small-integer-only (1..10000). We cap on parse so a stale
   // share link can't pin a million-row scan onto the client.
   if (f.limit != null && f.limit > 0) p.set('limit', String(f.limit));
+  for (const t of f.tags ?? []) {
+    p.append('tag', t.key === null ? t.values.join(',') : `${t.key}:${t.values.join(',')}`);
+  }
   return p;
 }
 
@@ -111,5 +134,10 @@ export function parseFilterParams(p: URLSearchParams): FilterState {
     if (Number.isFinite(n) && n > 0 && n <= 10000) limit = n;
   }
 
-  return { query, statuses, levels, sinceMs, spikingOnly, sort, limit };
+  const tags = p
+    .getAll('tag')
+    .map(parseTagParam)
+    .filter((t): t is TagFilter => t !== null);
+
+  return { query, statuses, levels, sinceMs, spikingOnly, sort, limit, tags };
 }

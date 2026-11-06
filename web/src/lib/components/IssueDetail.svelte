@@ -23,8 +23,12 @@
   import { toast } from '$lib/toast.svelte';
   import type { Issue } from '$lib/types';
   import { cn, relativeTime, shortFingerprint } from '$lib/utils';
+  import { causeChain, primaryDartStack } from '$lib/eventDetail';
   import Breadcrumbs from './Breadcrumbs.svelte';
+  import Contexts from './Contexts.svelte';
+  import ErrorChain from './ErrorChain.svelte';
   import EventData from './EventData.svelte';
+  import RawEvent from './RawEvent.svelte';
   import Releases from './Releases.svelte';
   import StackTrace from './StackTrace.svelte';
   import Tags from './Tags.svelte';
@@ -35,6 +39,13 @@
   const event = $derived(selection.event);
   const eventLoading = $derived(selection.eventLoading);
   const assignee = $derived(issue ? actions.assigneeFor(issue) : null);
+  const payload = $derived(event?.raw.payload ?? null);
+  // An app event carries its stack as an obfuscated Dart trace and its
+  // wrapped causes in `extra`; a Sentry SDK event carries frames.
+  const hasDartDetail = $derived(
+    payload !== null && (primaryDartStack(payload).stack !== null || causeChain(payload).length > 0)
+  );
+  const hasFrames = $derived((event?.exception?.frames.length ?? 0) > 0);
 
   function levelDot(level: string | null | undefined): string {
     switch (level) {
@@ -293,8 +304,18 @@
     </header>
 
     <div class="flex-1 overflow-y-auto">
-      <StackTrace exception={event?.exception ?? null} loading={eventLoading} />
-      <Separator />
+      {#if payload && hasDartDetail && !eventLoading}
+        <ErrorChain
+          {payload}
+          type={event?.exception?.type ?? null}
+          message={event?.exception?.value ?? null}
+        />
+        <Separator />
+      {/if}
+      {#if hasFrames || !hasDartDetail || eventLoading}
+        <StackTrace exception={event?.exception ?? null} loading={eventLoading} />
+        <Separator />
+      {/if}
       <Releases {issue} />
       <Separator />
       <Breadcrumbs
@@ -304,7 +325,13 @@
       <Separator />
       <Tags tags={event?.tags ?? {}} />
       <Separator />
-      <EventData payload={event?.raw.payload ?? null} />
+      <Contexts contexts={payload?.contexts} />
+      <Separator />
+      <EventData {payload} />
+      {#if event && !eventLoading}
+        <Separator />
+        <RawEvent stored={event.raw} />
+      {/if}
     </div>
   </div>
 {/if}

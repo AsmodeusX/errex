@@ -33,6 +33,7 @@
     filter.spikingOnly = next.spikingOnly;
     filter.sort = next.sort;
     filter.limit = next.limit ?? null;
+    filter.tags = next.tags ?? [];
   });
 
   // Push filter state into the URL so the active filter is reload-safe
@@ -48,7 +49,8 @@
       sinceMs: filter.sinceMs,
       spikingOnly: filter.spikingOnly,
       sort: filter.sort,
-      limit: filter.limit
+      limit: filter.limit,
+      tags: filter.tags
     });
     const search = params.toString();
     const target = location.pathname + (search ? `?${search}` : '') + location.hash;

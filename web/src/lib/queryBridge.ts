@@ -10,7 +10,7 @@
 //  the input text via `filterToQueryString`.
 // ─────────────────────────────────────────────────────────────────────
 
-import { parseQuery, type Query } from './queryParser';
+import { parseQuery, type Query, type TagFilter } from './queryParser';
 import type { FilterStore } from './stores.svelte';
 import type { IssueLevel, IssueStatus, SortKey } from './types';
 
@@ -56,6 +56,7 @@ export function applyQueryToFilter(query: Query, filter: FilterStore): void {
   filter.staleOnly = query.staleOnly;
   filter.sort = query.sort ?? 'recent';
   filter.limit = query.limit;
+  filter.tags = query.tags.map((t) => ({ key: t.key, values: [...t.values] }));
 
   // Free-text + words → folded into filter.query so the existing
   // substring-matcher in visibleIssues finds them. Multi-term composes
@@ -100,11 +101,17 @@ export function filterToQueryString(filter: FilterStore): string {
   if (filter.staleOnly) parts.push('stale');
   if (filter.sort && filter.sort !== 'recent') parts.push(`sort:${filter.sort}`);
   if (filter.limit != null) parts.push(`limit:${filter.limit}`);
+  for (const t of filter.tags ?? []) parts.push(tagToken(t));
 
   // Free text last, so facets read first.
   if (filter.query.trim().length > 0) parts.push(filter.query.trim());
 
   return parts.join(' ');
+}
+
+/** `tag:KEY:V1,V2`, or `tag:V` for a filter without a key. */
+export function tagToken(t: TagFilter): string {
+  return t.key === null ? `tag:${t.values.join(',')}` : `tag:${t.key}:${t.values.join(',')}`;
 }
 
 function formatSince(ms: number): string {

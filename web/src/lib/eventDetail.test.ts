@@ -1,14 +1,23 @@
 import { describe, expect, it } from 'vitest';
 import {
   additionalData,
+  breadcrumbData,
   breadcrumbRelativeTime,
+  breadcrumbsInTimeOrder,
+  causeChain,
+  contextSections,
   dedupTags,
+  eventFileName,
   formatData,
   frameDetails,
+  groupTags,
   partitionFrames,
+  primaryDartStack,
+  stackBuildId,
+  symbolicationJson,
   throwSiteIndex
 } from './eventDetail';
-import type { EventPayload, Frame } from './types';
+import type { Breadcrumb, EventPayload, Frame, StoredEvent } from './types';
 
 describe('dedupTags', () => {
   it('drops `x.name` when `x` is also present', () => {
@@ -142,7 +151,13 @@ describe('additionalData', () => {
       message: 'm',
       release: 'r',
       tags: { a: 'b' },
-      extra: { dart_stack: '#00 abs 0000007a' },
+      extra: {
+        dart_stack: '#00 abs 0000007a',
+        build_id: '0f3a5b7c',
+        causes: [{ type: 'flash_failure' }],
+        transport_trace: [{ dir: 'tx' }],
+        app_build: 29
+      },
       contexts: { os: { name: 'Android' } },
       sdk: { name: 'zeus.reporter' },
       debug_meta: { images: [] },
@@ -152,14 +167,20 @@ describe('additionalData', () => {
       }
     };
     const keys = additionalData(p).map((e) => e.key);
+    // The stack, build id, causes and contexts have their own sections.
     expect(keys).toEqual([
-      'extra',
-      'contexts',
+      'extra.app_build',
+      'extra.transport_trace',
       'exception.mechanism',
       'debug_meta',
       'dist',
       'sdk'
     ]);
+  });
+
+  it('keeps an extra that is not an object whole', () => {
+    const p = { extra: 'note' } as unknown as EventPayload;
+    expect(additionalData(p)).toEqual([{ key: 'extra', value: 'note' }]);
   });
 
   it('skips empty and null values', () => {
@@ -204,5 +225,208 @@ describe('formatData', () => {
 
   it('pretty-prints structures', () => {
     expect(formatData({ a: 1 })).toBe('{\n  "a": 1\n}');
+  });
+});
+
+const STACK =
+  "build_id: '0f3a5b7c9d1e2f3a4152c37485e60718'\n" +
+  '#00 abs 000000750a2f5c1f virt 00000000002f5c1f _kDartIsolateSnapshotInstructions+0x2f5c1f';
+
+describe('groupTags', () => {
+  it('groups error, api, ecu and session tags first, then the rest by prefix', () => {
+    const groups = groupTags({
+      'os.version': '14',
+      'error.detail': 'm1a2b3c4d',
+      'api.code': 'bad_credentials',
+      'ecu.board': 'msd81',
+      'flash.stage': 'erase',
+      'error.code': 'state_error',
+      'device.class': 'phone',
+      'error.context': 'flash_plan',
+      'recovery.pending': 'false',
+      'network.state': 'online',
+      'app.distribution': 'play',
+      'api.kind': 'defect',
+      'ecu.software.kind': 'ours',
+      'ecu.release': '1.0.11',
+      'recovery.status': 'none',
+      os: 'android',
+      plain: 'x'
+    });
+    expect(groups.map((g) => g.id)).toEqual(['error', 'api', 'ecu', 'session', 'flash', 'recovery', 'other']);
+    expect(groups[0]!.entries).toEqual([
+      ['error.code', 'state_error'],
+      ['error.context', 'flash_plan'],
+      ['error.detail', 'm1a2b3c4d']
+    ]);
+    expect(groups[2]!.entries.map(([k]) => k)).toEqual(['ecu.board', 'ecu.release', 'ecu.software.kind']);
+    expect(groups[3]!.entries.map(([k]) => k)).toEqual([
+      'app.distribution',
+      'device.class',
+      'network.state',
+      'os',
+      'os.version',
+      'recovery.pending'
+    ]);
+    expect(groups[5]!.entries).toEqual([['recovery.status', 'none']]);
+    expect(groups[6]!.entries).toEqual([['plain', 'x']]);
+  });
+
+  it('returns no groups for no tags', () => {
+    expect(groupTags({})).toEqual([]);
+  });
+});
+
+describe('primaryDartStack', () => {
+  it('reads the stack and the build id from extra', () => {
+    const p: EventPayload = { extra: { dart_stack: STACK, build_id: 'abcdef01' } };
+    expect(primaryDartStack(p)).toEqual({ stack: STACK, buildId: 'abcdef01' });
+  });
+
+  it('falls back to the build id the stack header names', () => {
+    expect(primaryDartStack({ extra: { dart_stack: STACK } })).toEqual({
+      stack: STACK,
+      buildId: '0f3a5b7c9d1e2f3a4152c37485e60718'
+    });
+  });
+
+  it('ignores a scrubbed build id in favour of the header', () => {
+    expect(primaryDartStack({ extra: { dart_stack: STACK, build_id: '<hex>' } }).buildId).toBe(
+      '0f3a5b7c9d1e2f3a4152c37485e60718'
+    );
+  });
+
+  it('is empty without a string stack', () => {
+    expect(primaryDartStack({})).toEqual({ stack: null, buildId: null });
+    expect(primaryDartStack({ extra: { dart_stack: 42 } })).toEqual({ stack: null, buildId: null });
+    expect(primaryDartStack({ extra: { dart_stack: '' } })).toEqual({ stack: null, buildId: null });
+  });
+});
+
+describe('stackBuildId', () => {
+  it('reads quoted and bare build ids, lower-cased', () => {
+    expect(stackBuildId("build_id: 'ABCDEF0123'")).toBe('abcdef0123');
+    expect(stackBuildId('x\nbuild_id: abcdef0123\n#00')).toBe('abcdef0123');
+    expect(stackBuildId('#00 abs 1')).toBeNull();
+  });
+});
+
+describe('causeChain', () => {
+  it('keeps the order and the fields the app sends', () => {
+    const p: EventPayload = {
+      extra: {
+        causes: [
+          { type: 'flash_failure', message: 'flash_failure', dart_stack: STACK },
+          { type: 'host_refusal', message: 'host_refusal', dart_stack: '' }
+        ]
+      }
+    };
+    expect(causeChain(p)).toEqual([
+      { type: 'flash_failure', message: 'flash_failure', stack: STACK },
+      { type: 'host_refusal', message: 'host_refusal', stack: null }
+    ]);
+  });
+
+  it('drops entries that are not objects and coerces nothing else', () => {
+    const p = {
+      extra: { causes: ['x', null, { type: 3, message: { a: 1 }, dart_stack: STACK }] }
+    } as unknown as EventPayload;
+    expect(causeChain(p)).toEqual([{ type: null, message: null, stack: STACK }]);
+  });
+
+  it('is empty when there are no causes', () => {
+    expect(causeChain({})).toEqual([]);
+    expect(causeChain({ extra: { causes: 'x' } })).toEqual([]);
+  });
+
+  it('is bounded', () => {
+    const many = Array.from({ length: 100 }, () => ({ type: 't' }));
+    expect(causeChain({ extra: { causes: many } })).toHaveLength(16);
+  });
+});
+
+describe('breadcrumbData', () => {
+  it('lists every data field, values as text', () => {
+    const bc: Breadcrumb = {
+      category: 'licensing',
+      message: 'Licensing activate: 409',
+      data: { endpoint: 'activate', status: '409', code: 'bad_credentials', kind: 'input', n: 3, o: { a: 1 } }
+    };
+    expect(breadcrumbData(bc)).toEqual([
+      ['endpoint', 'activate'],
+      ['status', '409'],
+      ['code', 'bad_credentials'],
+      ['kind', 'input'],
+      ['n', '3'],
+      ['o', '{"a":1}']
+    ]);
+  });
+
+  it('is empty without data', () => {
+    expect(breadcrumbData({ message: 'm' })).toEqual([]);
+    expect(breadcrumbData({ data: null })).toEqual([]);
+    expect(breadcrumbData({ data: 'x' } as unknown as Breadcrumb)).toEqual([]);
+  });
+});
+
+describe('breadcrumbsInTimeOrder', () => {
+  it('orders by timestamp, oldest first, keeping ties in sent order', () => {
+    const bcs: Breadcrumb[] = [
+      { message: 'c', timestamp: 30 },
+      { message: 'a', timestamp: 10 },
+      { message: 'b1', timestamp: '1970-01-01T00:00:20Z' },
+      { message: 'b2', timestamp: 20 }
+    ];
+    expect(breadcrumbsInTimeOrder(bcs).map((b) => b.message)).toEqual(['a', 'b1', 'b2', 'c']);
+  });
+
+  it('keeps an undated breadcrumb after the one sent before it', () => {
+    const bcs: Breadcrumb[] = [
+      { message: 'b', timestamp: 20 },
+      { message: 'b-undated' },
+      { message: 'a', timestamp: 10 }
+    ];
+    expect(breadcrumbsInTimeOrder(bcs).map((b) => b.message)).toEqual(['a', 'b', 'b-undated']);
+  });
+
+  it('does not mutate its input', () => {
+    const bcs: Breadcrumb[] = [{ timestamp: 2 }, { timestamp: 1 }];
+    breadcrumbsInTimeOrder(bcs);
+    expect(bcs[0]!.timestamp).toBe(2);
+  });
+});
+
+describe('contextSections', () => {
+  it('lists each context with its fields', () => {
+    expect(
+      contextSections({ os: { name: 'Android', version: '14' }, device: { class: 'phone' }, empty: {}, x: 'y' })
+    ).toEqual([
+      { name: 'device', fields: [['class', 'phone']] },
+      { name: 'os', fields: [['name', 'Android'], ['version', '14']] },
+      { name: 'x', fields: [['value', 'y']] }
+    ]);
+  });
+
+  it('is empty without contexts', () => {
+    expect(contextSections(null)).toEqual([]);
+    expect(contextSections(undefined)).toEqual([]);
+  });
+});
+
+describe('symbolicationJson', () => {
+  it('is the event payload, which tool/symbolize.dart reads', () => {
+    const stored: StoredEvent = {
+      event_id: 'e1',
+      received_at: '2026-11-05T00:00:00Z',
+      payload: { extra: { dart_stack: STACK } }
+    };
+    expect(JSON.parse(symbolicationJson(stored))).toEqual({ extra: { dart_stack: STACK } });
+  });
+});
+
+describe('eventFileName', () => {
+  it('names the file by event id, keeping only safe characters', () => {
+    expect(eventFileName('0f3a5b7c9d1e4f3a')).toBe('errex-event-0f3a5b7c9d1e4f3a.json');
+    expect(eventFileName('../../x y')).toBe('errex-event-xy.json');
   });
 });

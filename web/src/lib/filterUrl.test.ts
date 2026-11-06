@@ -285,3 +285,40 @@ describe('parseFilterParams + sort', () => {
     expect(parseFilterParams(p).query).toBe('/Error.*403/');
   });
 });
+
+describe('tag filters in the URL', () => {
+  const base = {
+    query: '',
+    statuses: new Set<IssueStatus>(['unresolved']),
+    levels: new Set<IssueLevel>(),
+    sinceMs: null,
+    spikingOnly: false,
+    sort: 'recent' as SortKey
+  };
+
+  it('writes one tag param per filter and reads them back', () => {
+    const p = serializeFilterParams({
+      ...base,
+      tags: [
+        { key: 'error.code', values: ['state_error', 'format'] },
+        { key: null, values: ['flash_plan'] }
+      ]
+    });
+    expect(p.getAll('tag')).toEqual(['error.code:state_error,format', 'flash_plan']);
+    expect(parseFilterParams(p).tags).toEqual([
+      { key: 'error.code', values: ['state_error', 'format'] },
+      { key: null, values: ['flash_plan'] }
+    ]);
+  });
+
+  it('omits tag when there are no tag filters, and reads none back', () => {
+    const p = serializeFilterParams({ ...base, tags: [] });
+    expect(p.has('tag')).toBe(false);
+    expect(parseFilterParams(p).tags).toEqual([]);
+  });
+
+  it('drops a malformed tag param', () => {
+    const p = new URLSearchParams('tag=&tag=a%20b:c&tag=error.code:');
+    expect(parseFilterParams(p).tags).toEqual([]);
+  });
+});

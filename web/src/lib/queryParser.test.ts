@@ -226,6 +226,15 @@ describe('queryParser — tags + URLs', () => {
     ]);
   });
 
+  it('tag:KEY:VALUE with dotted keys and values', () => {
+    expect(q('tag:error.code:state_error').tags).toEqual([
+      { key: 'error.code', values: ['state_error'] }
+    ]);
+    expect(q('tag:ecu.release:1.0.11,1.0.*').tags).toEqual([
+      { key: 'ecu.release', values: ['1.0.11', '1.0.*'] }
+    ]);
+  });
+
   it('tag:VALUE (loose, key=null)', () => {
     expect(q('tag:windows').tags).toEqual([{ key: null, values: ['windows'] }]);
   });
